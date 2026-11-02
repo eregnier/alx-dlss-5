@@ -77,7 +77,6 @@ public:
             HLX_ERROR("Failed to CreateCommandList: 0x%08X", hr);
             return false;
         }
-        commandList_->Close();
 
         // Create Fence
         hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));

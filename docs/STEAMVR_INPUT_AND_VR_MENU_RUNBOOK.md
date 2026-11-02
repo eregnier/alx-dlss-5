@@ -159,13 +159,22 @@ Une fois le menu ouvert, le joueur s'attend à pouvoir naviguer immédiatement a
 
 ### La Solution Multi-Sources & Découplage D-Pad vs Joystick
 1. **D-Pad Gauche (Capacitif & Squelettique) vs Joystick Gauche (`thumbOnLeftStick`)** :
-   * Poser le pouce sur le D-Pad/face du contrôleur est détecté par le tracking squelettique SteamVR (`skelThumbCurl >= 0.12f`) ou les clics de face (X, Y).
-   * **Détection du Joystick Gauche (`thumbOnLeftStick`)** : Actif dès que le chapeau du stick est touché capacitivement (`bLeftTeleportTouch`), cliqué, ou que le stick est dévié/en mouvement (`std::abs > 0.20f` ou `bLeftWalkTouch`).
-   * **Validation Stricte** : `validLeftDpad = leftDpadTouched && !thumbOnLeftStick`. Si le pouce est sur le joystick ou si le joueur avance, le D-Pad gauche est formellement invalidé.
+   * **Constat mesuré (bindings Alyx `game/hlvr/cfg/bindings_touch*.json` + profil `oculus_touch`)** : `/input/joystick` et `/input/thumbrest` (la **zone plate**) exposent bien un `touch`, mais **aucune action d'Alyx ne les lit** (`Walk` = clic du stick, `Teleport` = directions, `FingerCurlThumb` non mappée). Les masques legacy `GetControllerState` sont à 0 (aucune ligne `[BTN-RAW]`), et `legacy_bindings_touch.json` ne mappe pas le thumbrest.
+   * **Le curl squelettique n'est pas un capteur de position** : `FromDevice` == `FromAnimation` sur 358/361 échantillons. Il ne rapporte que le **touch capacitif du chapeau de stick** (`0.41`), tout le reste (zone plate *ou* pouce absent) tombe en main ouverte (`0.00-0.08`).
+   * **Règle implémentée (`ClassifyLeftThumb` dans [`include/input_combo.hpp`](file:///C:/code/hlx-dlss5/include/input_combo.hpp))** :
+     * `onStick` = clic stick (`Walk`) **ou** déflexion (`Teleport`/legacy) **ou** `|stickX|/|stickY| > 0.20` **ou** `thumbCurl >= 0.25` (touch du chapeau).
+     * `onFacePlate` = **pas** `onStick` **et** (`bouton de face cliqué` **ou** `thumbCurl > 0.02` **ou** `FingerCurlThumb >= 0.40`).
+     * **Priorité absolue au stick** : un pouce sur le joystick n'arme jamais un raccourci.
+   * **Limite connue** : le thumbrest n'étant pas exposé, « pouce sur la zone plate » et « pouce absent » sont indistinguables. Pour une détection exacte il faudrait un **action set custom** (`/actions/hlx` + bindings `thumbrest/touch`) via un hook de `SetActionManifestPath` — non fait, trop risqué pour l'input du jeu.
+   * **Calibration en jeu** : touche **F9** → 120 frames de `[CAPTURE]` (PLATE/STICK/NONE + Dev/Anim curls) pour revalider les seuils sur un autre contrôleur.
+   * **Bug corrigé au passage** : `state.rAxis[2]` (le **grip**) était injecté dans `leftStickX/Y` et `rightStickX/Y` — serrer la poignée gauche était vu comme une déviation du stick. `rAxis[2]` n'est plus lu comme un axe de stick.
+
 2. **Module Centralisé & Tests Automatisés (`InputComboEvaluator`)** :
-   * Implémenté dans [`include/input_combo.hpp`](file:///C:/code/hlx-dlss5/include/input_combo.hpp) et couvert par 10 scénarios de tests unitaires automatisés ([`tests/test_input_combos.cpp`](file:///C:/code/hlx-dlss5/tests/test_input_combos.cpp)) exécutés par `ctest`.
-   * **Raccourci 1 (Toggle DLSS 5)** : `D-Pad gauche + Majeur droit (>= 70%)`. Aucun menu, bips audio (1800 Hz / 650 Hz). Ne se déclenche JAMAIS si le pouce est sur le joystick ou si le joueur avance.
-   * **Raccourci 2 (Toggle Menu Flottant)** : `D-Pad gauche + Joystick droit vers le haut (> 0.40)`. Affiche ou masque l'overlay sans modifier l'état actif de DLSS 5.
+   * Implémenté dans [`include/input_combo.hpp`](file:///C:/code/hlx-dlss5/include/input_combo.hpp) et couvert par 19 scénarios de tests unitaires automatisés ([`tests/test_input_combos.cpp`](file:///C:/code/hlx-dlss5/tests/test_input_combos.cpp)) exécutés par `ctest` (dont 7 dédiés à la classification pouce stick / zone plate).
+   * **Raccourci 1 (Toggle DLSS 5)** : `D-Pad gauche + Majeur droit (Grip / HandCurl >= 70%)`. Aucun menu, bips audio (1800 Hz / 650 Hz). Ne se déclenche JAMAIS si le pouce est sur le joystick ou si le joueur avance.
+   * **Raccourci 2 (Toggle Menu Flottant)** : `D-Pad gauche + Index droit (gâchette / TriggerPull >= 70%)`. Fallback secondaire conservé : `D-Pad gauche + Joystick droit vers le haut (> 0.40)`. Affiche ou masque l'overlay sans modifier l'état actif de DLSS 5.
+   * **Découplage Majeur / Index** : grip et gâchette sont lus séparément (`HandCurl` vs `TriggerPull`). Grip = toggle DLSS, gâchette = menu. Les deux ensemble = ambigu → aucun déclenchement.
+   * **Mesure justifiant le découplage** : dans `hlx_dlss5.log`, un `[USER-QUICK-TOGGLE]` est apparu avec `Grip=0.50` dans le probe (max grip/gâchette) → c'était donc la **gâchette** qui franchissait 0.70, pas le majeur. Le probe `[VRINPUT-PROBE]` journalise désormais `GripD` et `TrigD` séparément pour le vérifier en jeu.
    * **Cooldown & Réarmement** : 1,2s obligatoire avec exigence de relâchement complet des touches avant tout réarmement.
 
 ---

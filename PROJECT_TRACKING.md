@@ -138,7 +138,7 @@
   - [x] Création d'un overlay dynamique SteamVR (`CreateOverlay` / `SetOverlayRaw`) positionné devant le regard du joueur (70 cm).
   - [x] Rasterizer GDI vectoriel pour affichage des 14 paramètres DLSS 5 en temps réel avec mini-jauges et sliders.
   - [x] **Hook VTable Slot 4 `IVRInput::UpdateActionState`** : Injection à chaud de `/actions/dev` pour débloquer le bouton Y de la manette gauche.
-  - [x] **Double déclencheur universel** : Combo DPAD (Bouton Y/X) + Stick Haut, OU poussée simultanée des deux sticks vers le haut.
+  - [x] **Double déclencheur universel** : Combo D-Pad gauche (pouce sur zone plate) + Index droit (gâchette) pour le menu, OU + Majeur droit (grip) pour le toggle DLSS. Fallback menu : Stick droit vers le haut.
   - [x] **Navigation complète au stick gauche** : Filtrage par axe dominant (deadzone 0.35), suppression des interférences diagonales et du conflit avec la marche.
   - [x] Persistance en temps réel des paramètres dans `hlx_dlss5.ini`.
   - [x] Documentation complète dans [`docs/STEAMVR_INPUT_AND_VR_MENU_RUNBOOK.md`](file:///C:/code/hlx-dlss5/docs/STEAMVR_INPUT_AND_VR_MENU_RUNBOOK.md).

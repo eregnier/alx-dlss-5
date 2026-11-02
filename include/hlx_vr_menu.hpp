@@ -10,14 +10,15 @@
 #include "hlx_config.hpp"
 #include "stereo_pipeline.hpp"
 #include "dlss5_bridge.hpp"
+#include "gaze_tracker.hpp"
 
 namespace hlx {
 
 class VRMenu {
 public:
     static constexpr int MENU_WIDTH = 560;
-    static constexpr int MENU_HEIGHT = 470;
-    static constexpr int ROW_COUNT = 14;
+    static constexpr int MENU_HEIGHT = 548;
+    static constexpr int ROW_COUNT = 17;
 
     static VRMenu& Instance() {
         static VRMenu instance;
@@ -99,16 +100,16 @@ public:
             changed = true;
             break;
 
-        case 2: // Foveated Width [0.20 - 1.0]
-            config.foveated_width += direction * 0.05f;
-            if (config.foveated_width < 0.20f) config.foveated_width = 0.20f;
+        case 2: // Foveated Width [0.00 - 1.00] (0% - 100%)
+            config.foveated_width = std::round((config.foveated_width + direction * 0.05f) * 20.0f) / 20.0f;
+            if (config.foveated_width < 0.0f) config.foveated_width = 0.0f;
             if (config.foveated_width > 1.0f) config.foveated_width = 1.0f;
             changed = true;
             break;
 
-        case 3: // Foveated Height [0.20 - 1.0]
-            config.foveated_height += direction * 0.05f;
-            if (config.foveated_height < 0.20f) config.foveated_height = 0.20f;
+        case 3: // Foveated Height [0.00 - 1.00] (0% - 100%)
+            config.foveated_height = std::round((config.foveated_height + direction * 0.05f) * 20.0f) / 20.0f;
+            if (config.foveated_height < 0.0f) config.foveated_height = 0.0f;
             if (config.foveated_height > 1.0f) config.foveated_height = 1.0f;
             changed = true;
             break;
@@ -168,7 +169,24 @@ public:
             changed = true;
             break;
 
-        case 13: // [ FERMER LE MENU ]
+        case 13: // Working Scale [0.35 - 1.00]
+            config.working_scale += direction * 0.05f;
+            if (config.working_scale < 0.35f) config.working_scale = 0.35f;
+            if (config.working_scale > 1.00f) config.working_scale = 1.00f;
+            changed = true;
+            break;
+
+        case 14: // Passes [1 - 3]
+            config.passes = ((config.passes - 1 + direction + 3) % 3) + 1;
+            changed = true;
+            break;
+
+        case 15: // Dynamic Foveated Rendering / Eye Tracking [Toggle]
+            config.eye_tracking = !config.eye_tracking;
+            changed = true;
+            break;
+
+        case 16: // [ FERMER LE MENU ]
             Hide(pOverlay);
             PlaySoundAsync(600, 60);
             return;
@@ -188,6 +206,12 @@ public:
 
         EnsureOverlay(pOverlay);
         if (m_hOverlay == vr::k_ulOverlayHandleInvalid) return;
+
+        bool hwGazeNow = GazeTracker::Instance().IsHardwareGazeActive();
+        if (hwGazeNow != m_lastRenderedGazeActive) {
+            m_lastRenderedGazeActive = hwGazeNow;
+            m_dirty = true;
+        }
 
         if (m_dirty) {
             Render(config);
@@ -209,6 +233,7 @@ public:
 private:
     bool m_visible = false;
     bool m_dirty = true;
+    bool m_lastRenderedGazeActive = false;
     int m_selectedRow = 0;
     vr::VROverlayHandle_t m_hOverlay = vr::k_ulOverlayHandleInvalid;
 
@@ -417,22 +442,24 @@ private:
                 DrawMiniSlider(m_hGdiMemDC, 335, y + 8, 200, 8, config.detail_boost / 2.0f, RGB(230, 170, 0), RGB(255, 220, 0));
                 break;
 
-            case 2: // Foveated Width
-                TextOutA(m_hGdiMemDC, 30, y + 3, "Largeur Fovea (Width)", 21);
-                sprintf_s(valBuf, sizeof(valBuf), "%.2f", config.foveated_width);
+            case 2: // Foveated Width (0% - 100%)
+                TextOutA(m_hGdiMemDC, 30, y + 3, "Largeur Zone Fovea (0-100%)", 27);
+                if (config.foveated_width <= 0.005f) sprintf_s(valBuf, sizeof(valBuf), "0%% [OFF]");
+                else sprintf_s(valBuf, sizeof(valBuf), "%.0f%%", config.foveated_width * 100.0f);
                 SelectObject(m_hGdiMemDC, hFontValue);
                 SetTextColor(m_hGdiMemDC, isActive ? RGB(80, 255, 180) : RGB(160, 220, 180));
                 TextOutA(m_hGdiMemDC, 245, y + 4, valBuf, static_cast<int>(strlen(valBuf)));
-                DrawMiniSlider(m_hGdiMemDC, 335, y + 8, 200, 8, (config.foveated_width - 0.20f) / 0.80f, RGB(0, 200, 140), RGB(80, 255, 180));
+                DrawMiniSlider(m_hGdiMemDC, 335, y + 8, 200, 8, config.foveated_width, RGB(0, 200, 140), RGB(80, 255, 180));
                 break;
 
-            case 3: // Foveated Height
-                TextOutA(m_hGdiMemDC, 30, y + 3, "Hauteur Fovea (Height)", 22);
-                sprintf_s(valBuf, sizeof(valBuf), "%.2f", config.foveated_height);
+            case 3: // Foveated Height (0% - 100%)
+                TextOutA(m_hGdiMemDC, 30, y + 3, "Hauteur Zone Fovea (0-100%)", 27);
+                if (config.foveated_height <= 0.005f) sprintf_s(valBuf, sizeof(valBuf), "0%% [OFF]");
+                else sprintf_s(valBuf, sizeof(valBuf), "%.0f%%", config.foveated_height * 100.0f);
                 SelectObject(m_hGdiMemDC, hFontValue);
                 SetTextColor(m_hGdiMemDC, isActive ? RGB(80, 255, 180) : RGB(160, 220, 180));
                 TextOutA(m_hGdiMemDC, 245, y + 4, valBuf, static_cast<int>(strlen(valBuf)));
-                DrawMiniSlider(m_hGdiMemDC, 335, y + 8, 200, 8, (config.foveated_height - 0.20f) / 0.80f, RGB(0, 200, 140), RGB(80, 255, 180));
+                DrawMiniSlider(m_hGdiMemDC, 335, y + 8, 200, 8, config.foveated_height, RGB(0, 200, 140), RGB(80, 255, 180));
                 break;
 
             case 4: // Foveated Roundness
@@ -543,7 +570,58 @@ private:
                 }
                 break;
 
-            case 13: // [ FERMER LE MENU ]
+            case 13: // Working Scale
+                TextOutA(m_hGdiMemDC, 30, y + 3, "Echelle Interne IA (Scale)", 26);
+                sprintf_s(valBuf, sizeof(valBuf), "%.0f%%", config.working_scale * 100.0f);
+                SelectObject(m_hGdiMemDC, hFontValue);
+                SetTextColor(m_hGdiMemDC, isActive ? RGB(0, 240, 255) : RGB(140, 200, 230));
+                TextOutA(m_hGdiMemDC, 245, y + 4, valBuf, static_cast<int>(strlen(valBuf)));
+                DrawMiniSlider(m_hGdiMemDC, 335, y + 8, 200, 8, (config.working_scale - 0.35f) / 0.65f, RGB(0, 160, 225), RGB(0, 255, 255));
+                break;
+
+            case 14: // Passes (1 / 2 / 3)
+                {
+                    TextOutA(m_hGdiMemDC, 30, y + 3, "Passes IA DLSS 5 (1/2/3)", 24);
+                    static const char* passNames[3] = {
+                        "1 Passe (Optimal VR)", "2 Passes (Renforce)", "3 Passes (Ultra)"
+                    };
+                    int pIdx = (config.passes >= 1 && config.passes <= 3) ? (config.passes - 1) : 0;
+                    SelectObject(m_hGdiMemDC, hFontValue);
+                    SetTextColor(m_hGdiMemDC, isActive ? RGB(255, 240, 120) : RGB(210, 200, 160));
+                    TextOutA(m_hGdiMemDC, 245, y + 4, passNames[pIdx], static_cast<int>(strlen(passNames[pIdx])));
+                }
+                break;
+
+            case 15: // Dynamic Foveated Rendering / Eye Tracking
+                {
+                    TextOutA(m_hGdiMemDC, 30, y + 3, "Suivi Oculaire DFR (EyeTrack)", 29);
+                    SelectObject(m_hGdiMemDC, hFontBadge);
+                    bool hwActive = GazeTracker::Instance().IsHardwareGazeActive();
+                    const char* txt = !config.eye_tracking
+                        ? "[ DESACTIVE (FIXE) ]"
+                        : (hwActive ? "[ ACTIF - REGARD DETECTE ]" : "[ AUTO - FIXE (PAS D'ET) ]");
+                    COLORREF cBg = !config.eye_tracking
+                        ? RGB(50, 50, 50)
+                        : (hwActive ? RGB(15, 95, 50) : RGB(16, 60, 95));
+                    COLORREF cBd = !config.eye_tracking
+                        ? RGB(140, 140, 140)
+                        : (hwActive ? RGB(45, 230, 100) : RGB(0, 180, 255));
+                    HBRUSH hb = CreateSolidBrush(cBg);
+                    HPEN hp = CreatePen(PS_SOLID, 1, cBd);
+                    SelectObject(m_hGdiMemDC, hb);
+                    SelectObject(m_hGdiMemDC, hp);
+                    RoundRect(m_hGdiMemDC, 335, y + 2, 535, y + 22, 6, 6);
+                    DeleteObject(hb);
+                    DeleteObject(hp);
+                    SetTextColor(m_hGdiMemDC, !config.eye_tracking
+                        ? RGB(200, 200, 200)
+                        : (hwActive ? RGB(200, 255, 210) : RGB(180, 230, 255)));
+                    RECT rc = { 335, y + 2, 535, y + 22 };
+                    DrawTextA(m_hGdiMemDC, txt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+                break;
+
+            case 16: // [ FERMER LE MENU ]
                 {
                     COLORREF bBg = isActive ? RGB(18, 70, 115) : RGB(15, 30, 48);
                     COLORREF bBd = isActive ? RGB(0, 230, 255) : RGB(40, 85, 130);
@@ -575,7 +653,7 @@ private:
         SelectObject(m_hGdiMemDC, hFontHelp);
         SetTextColor(m_hGdiMemDC, RGB(120, 160, 200));
         RECT rcHelp = { 10, footerY + 4, MENU_WIDTH - 10, MENU_HEIGHT - 3 };
-        DrawTextA(m_hGdiMemDC, "Stick Droit: Naviguer/Regler  |  Pouce G D-Pad + Stick Haut: Toggle  |  Row 13: Fermer", -1, &rcHelp, DT_CENTER | DT_SINGLELINE);
+        DrawTextA(m_hGdiMemDC, "Sticks/Fleches: Naviguer | Maintien X(G) 3s ou F8: Menu | Y(G)/Echap: Fermer", -1, &rcHelp, DT_CENTER | DT_SINGLELINE);
 
         // Cleanup GDI objects
         SelectObject(m_hGdiMemDC, hOldBrush);

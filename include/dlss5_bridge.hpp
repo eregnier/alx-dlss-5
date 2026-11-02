@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <cstdint>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include "hlx_logger.hpp"
@@ -39,10 +40,42 @@ using PFN_dlssnr_call_evaluate_v2 = int(*)(
 
 using PFN_dlssnr_call_release = void(*)(void* feature);
 using PFN_dlssnr_call_set_float_slot = void(*)(int slot);
+using PFN_dlssnr_call_probe_float = int(*)(void* params);
 using PFN_dlssnr_call_error = const char*(*)();
 
-using PFN_NVSDK_NGX_D3D12_Init_Ext = uint32_t(*)(uint64_t, const wchar_t*, ID3D12Device*, const void*, void*);
+struct NgxParameters {
+    virtual void Set(const char*, unsigned long long) = 0;
+    virtual void Set(const char*, float) = 0;
+    virtual void Set(const char*, double) = 0;
+    virtual void Set(const char*, unsigned int) = 0;
+    virtual void Set(const char*, int) = 0;
+    virtual void Set(const char*, ID3D11Resource*) = 0;
+    virtual void Set(const char*, ID3D12Resource*) = 0;
+    virtual void Set(const char*, void*) = 0;
+    virtual uint32_t Get(const char*, unsigned long long*) const = 0;
+    virtual uint32_t Get(const char*, float*) const = 0;
+    virtual uint32_t Get(const char*, double*) const = 0;
+    virtual uint32_t Get(const char*, unsigned int*) const = 0;
+    virtual uint32_t Get(const char*, int*) const = 0;
+    virtual uint32_t Get(const char*, ID3D11Resource**) const = 0;
+    virtual uint32_t Get(const char*, ID3D12Resource**) const = 0;
+    virtual uint32_t Get(const char*, void**) const = 0;
+    virtual void Reset() = 0;
+};
+
+inline uint32_t NeuralScalingRatioCallback(NgxParameters* parameters) noexcept {
+    if (!parameters) return 0xBAD00005u;
+    float scale = 1.0f;
+    if ((parameters->Get("DLSSNR.Scale", &scale) & 0xFFF00000u) == 0xBAD00000u) scale = 1.0f;
+    if (scale < 0.1f) scale = 0.1f;
+    if (scale > 1.0f) scale = 1.0f;
+    parameters->Set("DLSSNR.ScalingRatio", scale);
+    return 1u;
+}
+
+using PFN_NVSDK_NGX_D3D12_Init_Ext = uint32_t(*)(uint64_t, const wchar_t*, ID3D12Device*, uint32_t, const void*);
 using PFN_NVSDK_NGX_D3D12_GetCapabilityParameters = uint32_t(*)(void**);
+using PFN_NVSDK_NGX_D3D12_AllocateParameters = uint32_t(*)(void**);
 
 class DLSS5Bridge {
 public:
@@ -73,12 +106,36 @@ public:
 
         auto pfnInitCore = reinterpret_cast<PFN_NVSDK_NGX_D3D12_Init_Ext>(GetProcAddress(hCore_, "NVSDK_NGX_D3D12_Init_Ext"));
         auto pfnGetCapCore = reinterpret_cast<PFN_NVSDK_NGX_D3D12_GetCapabilityParameters>(GetProcAddress(hCore_, "NVSDK_NGX_D3D12_GetCapabilityParameters"));
+        auto pfnAllocParams = reinterpret_cast<PFN_NVSDK_NGX_D3D12_AllocateParameters>(GetProcAddress(hCore_, "NVSDK_NGX_D3D12_AllocateParameters"));
 
         wchar_t tempPath[MAX_PATH];
         GetTempPathW(MAX_PATH, tempPath);
-        pfnInitCore(0x24480451ull, tempPath, device_, nullptr, nullptr);
-        pfnGetCapCore(&capabilityParams_);
-        HLX_INFO("Initialized NGX Core capability parameters: %p", capabilityParams_);
+        uint32_t initRes = 0;
+        if (pfnInitCore) {
+            initRes = pfnInitCore(0x24480451ull, tempPath, device_, 0x0000015u, nullptr);
+        }
+        uint32_t capRes = 0;
+        if (pfnGetCapCore) {
+            capRes = pfnGetCapCore(&capabilityParams_);
+            if ((capRes & 0xFFF00000u) == 0xBAD00000u) {
+                capabilityParams_ = nullptr;
+            }
+        }
+        if (!capabilityParams_ && pfnAllocParams) {
+            uint32_t allocRes = pfnAllocParams(&capabilityParams_);
+            if ((allocRes & 0xFFF00000u) == 0xBAD00000u) {
+                capabilityParams_ = nullptr;
+            }
+        }
+        if (capabilityParams_) {
+            auto* ngxParams = reinterpret_cast<NgxParameters*>(capabilityParams_);
+            ngxParams->Set("DLSSNR.ScalingRatio", 1.0f);
+            ngxParams->Set("DLSSNR.Scale", 1.0f);
+            ngxParams->Set("DLSSNR.Upscaling", 0u);
+            ngxParams->Set("DLSSNRComputeScalingRatioCallback", reinterpret_cast<void*>(&NeuralScalingRatioCallback));
+            ngxParams->Set("PerfQualityValue", 0u);
+        }
+        HLX_INFO("Initialized NGX Core capability parameters: %p (init=0x%08X, cap=0x%08X)", capabilityParams_, initRes, capRes);
 
         // 2. Load nvngx.dll_dlssnr.dll forwarder
         const wchar_t* candidatePaths[] = {
@@ -112,7 +169,7 @@ public:
         }
 
         if (pfnSetFloatSlot_) {
-            pfnSetFloatSlot_(1);
+            pfnSetFloatSlot_(6);
         }
 
         // 3. Locate DLSS 5 Neural Model nvngx_dlssnr.dll
@@ -146,38 +203,77 @@ public:
         wchar_t tempPath[MAX_PATH];
         GetTempPathW(MAX_PATH, tempPath);
 
-        auto* cmdList = D3D12Interop::Instance().GetCommandList();
-        void* feature = pfnCreate_(
-            nrSnippetPath_.c_str(),
-            tempPath,
-            device_,
-            cmdList,
-            capabilityParams_,
-            width, height,
-            config_.preset,                           // preset [0 - 3]
-            static_cast<float>(config_.detail_boost), // intensity [0.0 - 2.0]
-            config_.style,                            // style [0 - 2]
-            config_.local_structure, config_.local_tone, config_.skin_structure,
-            config_.auto_mask ? 1 : 0,                // useAutoMask
-            0                                         // uiCorrection = 0
-        );
-
-        D3D12Interop::Instance().ExecuteAndSync();
-
-        if (!feature) {
-            HLX_ERROR("Failed to create DLSS-NR Feature 18 for Eye %u (%ux%u)", eyeIndex, width, height);
-            if (pfnCallError_) {
-                HLX_ERROR("DLSS-NR Model Error: %s", pfnCallError_());
-            }
-            return false;
+        if (capabilityParams_) {
+            auto* ngxParams = reinterpret_cast<NgxParameters*>(capabilityParams_);
+            ngxParams->Set("Width", width);
+            ngxParams->Set("Height", height);
+            ngxParams->Set("OutWidth", width);
+            ngxParams->Set("OutHeight", height);
+            ngxParams->Set("DLSSNR.InputWidth", width);
+            ngxParams->Set("DLSSNR.InputHeight", height);
+            ngxParams->Set("DLSSNR.OutputWidth", width);
+            ngxParams->Set("DLSSNR.OutputHeight", height);
+            ngxParams->Set("DLSSNR.Output.Width", width);
+            ngxParams->Set("DLSSNR.Output.Height", height);
+            ngxParams->Set("DLSSNR.ScalingRatio", 1.0f);
+            ngxParams->Set("DLSSNR.Scale", 1.0f);
+            ngxParams->Set("DLSSNR.Upscaling", 0u);
+            ngxParams->Set("DLSSNRComputeScalingRatioCallback", reinterpret_cast<void*>(&NeuralScalingRatioCallback));
         }
 
-        eye.nrFeature = feature;
+        float skinStrength = (config_.skin_structure < 0.0f) ? 1.0f : config_.skin_structure;
+        uint32_t numPasses = static_cast<uint32_t>((std::clamp)(config_.passes, 1, 3));
+
+        for (uint32_t p = 0; p < EyeContext::MAX_PASSES; ++p) {
+            if (eye.nrFeatures[p] && pfnRelease_) {
+                pfnRelease_(eye.nrFeatures[p]);
+                eye.nrFeatures[p] = nullptr;
+            }
+        }
+        eye.nrFeature = nullptr;
+
+        for (uint32_t p = 0; p < numPasses; ++p) {
+            auto* cmdList = D3D12Interop::Instance().GetCommandList();
+            float passLocalTone = (p == 0) ? config_.local_tone : 0.0f;
+            void* feature = pfnCreate_(
+                nrSnippetPath_.c_str(),
+                tempPath,
+                device_,
+                cmdList,
+                capabilityParams_,
+                width, height,
+                config_.preset,                           // preset [0 - 3]
+                static_cast<float>(config_.detail_boost), // intensity [0.0 - 2.0]
+                config_.style,                            // style [0 - 2]
+                config_.local_structure, passLocalTone, skinStrength,
+                config_.auto_mask ? 1 : 0,                // useAutoMask
+                0                                         // uiCorrection = 0
+            );
+
+            D3D12Interop::Instance().ExecuteAndSync();
+
+            if (!feature) {
+                HLX_ERROR("Failed to create DLSS-NR Feature 18 (Pass %u/%u) for Eye %u (%ux%u)", p + 1, numPasses, eyeIndex, width, height);
+                if (pfnCallError_) {
+                    HLX_ERROR("DLSS-NR Model Error: %s", pfnCallError_());
+                }
+                for (uint32_t k = 0; k < p; ++k) {
+                    if (eye.nrFeatures[k] && pfnRelease_) {
+                        pfnRelease_(eye.nrFeatures[k]);
+                        eye.nrFeatures[k] = nullptr;
+                    }
+                }
+                return false;
+            }
+            eye.nrFeatures[p] = feature;
+        }
+
+        eye.nrFeature = eye.nrFeatures[0];
         eye.width = width;
         eye.height = height;
         eye.isInitialized = true;
         eye.needsReset = true;
-        HLX_INFO("Successfully instantiated DLSS 5 Feature 18 for Eye %u: %p (%ux%u)", eyeIndex, feature, width, height);
+        HLX_INFO("Successfully instantiated %u DLSS 5 Feature 18 pass(es) for Eye %u: %p (%ux%u)", numPasses, eyeIndex, eye.nrFeature, width, height);
         return true;
     }
 
@@ -191,43 +287,80 @@ public:
 
         auto* cmdList = customCmdList ? customCmdList : D3D12Interop::Instance().GetCommandList();
         int reset = eye.needsReset ? 1 : 0;
+        float skinStrength = (config_.skin_structure < 0.0f) ? 1.0f : config_.skin_structure;
 
-        int res = pfnEvaluate_(
-            cmdList,
-            eye.nrFeature,
-            capabilityParams_,
-            eye.d3d12Input,
-            eye.depthRes,
-            eye.motionRes,
-            eye.d3d12Output,
-            eye.width, eye.height,
-            eye.width, eye.height,
-            eye.width, eye.height,
-            0, 0, 0, 0,
-            0,             // depthInverted
-            reset,
-            static_cast<float>(config_.detail_boost),
-            config_.style, // style
-            config_.local_structure, config_.local_tone, config_.skin_structure,
-            config_.auto_mask ? 1 : 0, // useAutoMask
-            0.0f, 0.0f     // mvScaleX, mvScaleY = 0.0f: disable motion vector warping on dummy/zero vectors
-        );
-
-        if (res == 1) {
-            eye.needsReset = false;
-            return true;
-        } else {
-            if (pfnCallError_) {
-                HLX_ERROR("EvaluateEye %u failed with error: %s", eyeIndex, pfnCallError_());
-            }
-            return false;
+        uint32_t numPasses = static_cast<uint32_t>((std::clamp)(config_.passes, 1, 3));
+        if (numPasses > 1 && (!eye.d3d12Interm || !eye.nrFeatures[1])) {
+            numPasses = 1;
         }
+        if (numPasses == 3 && !eye.nrFeatures[2]) {
+            numPasses = 2;
+        }
+
+        for (uint32_t p = 0; p < numPasses; ++p) {
+            ID3D12Resource* inColor = eye.d3d12Input;
+            ID3D12Resource* outColor = eye.d3d12Output;
+            if (numPasses == 2) {
+                inColor  = (p == 0) ? eye.d3d12Input  : eye.d3d12Interm;
+                outColor = (p == 0) ? eye.d3d12Interm : eye.d3d12Output;
+            } else if (numPasses == 3) {
+                if (p == 0)      { inColor = eye.d3d12Input;  outColor = eye.d3d12Output; }
+                else if (p == 1) { inColor = eye.d3d12Output; outColor = eye.d3d12Interm; }
+                else             { inColor = eye.d3d12Interm; outColor = eye.d3d12Output; }
+            }
+
+            float passLocalTone = (p == 0) ? config_.local_tone : 0.0f;
+            void* feature = eye.nrFeatures[p] ? eye.nrFeatures[p] : eye.nrFeature;
+
+            int res = pfnEvaluate_(
+                cmdList,
+                feature,
+                capabilityParams_,
+                inColor,
+                eye.depthRes,
+                eye.motionRes,
+                outColor,
+                eye.width, eye.height,
+                eye.width, eye.height,
+                eye.width, eye.height,
+                0, 0, 0, 0,
+                0,             // depthInverted
+                reset,
+                static_cast<float>(config_.detail_boost),
+                config_.style, // style
+                config_.local_structure, passLocalTone, skinStrength,
+                config_.auto_mask ? 1 : 0, // useAutoMask
+                0.0f, 0.0f     // mvScaleX, mvScaleY = 0.0f: disable motion vector warping on dummy/zero vectors
+            );
+
+            if (res != 1) {
+                if (pfnCallError_) {
+                    HLX_ERROR("EvaluateEye %u (Pass %u/%u) failed with error: %s", eyeIndex, p + 1, numPasses, pfnCallError_());
+                }
+                return false;
+            }
+
+            if (p + 1 < numPasses) {
+                D3D12_RESOURCE_BARRIER uavBarrier = {};
+                uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uavBarrier.UAV.pResource = outColor;
+                cmdList->ResourceBarrier(1, &uavBarrier);
+            }
+        }
+
+        eye.needsReset = false;
+        return true;
     }
 
     void ReleaseEyeFeature(uint32_t eyeIndex) {
         auto& eye = StereoPipeline::Instance().GetEye(eyeIndex);
+        for (uint32_t p = 0; p < EyeContext::MAX_PASSES; ++p) {
+            if (eye.nrFeatures[p] && pfnRelease_) {
+                pfnRelease_(eye.nrFeatures[p]);
+                eye.nrFeatures[p] = nullptr;
+            }
+        }
         if (eye.nrFeature && pfnRelease_) {
-            pfnRelease_(eye.nrFeature);
             eye.nrFeature = nullptr;
         }
     }
@@ -236,11 +369,7 @@ public:
         if (!isInitialized_) return;
         HLX_INFO("DLSS5Bridge shutting down...");
         for (uint32_t i = 0; i < 2; ++i) {
-            auto& eye = StereoPipeline::Instance().GetEye(i);
-            if (eye.nrFeature && pfnRelease_) {
-                pfnRelease_(eye.nrFeature);
-                eye.nrFeature = nullptr;
-            }
+            ReleaseEyeFeature(i);
         }
         isInitialized_ = false;
         HLX_INFO("DLSS5Bridge shutdown complete.");

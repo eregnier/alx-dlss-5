@@ -18,6 +18,8 @@
 #include "../include/foveated_composite_shader.hpp"
 #include "../include/hlx_vr_menu.hpp"
 #include "../include/input_combo.hpp"
+#include "../include/hlx_gpu_timers.hpp"
+#include "../include/gaze_tracker.hpp"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -45,6 +47,66 @@ static VTableHook g_updateActionStateHook;
 using PFN_UpdateActionState = vr::EVRInputError(*)(void* thisPtr, vr::VRActiveActionSet_t* pSets, uint32_t unSizeOfVRSelectedActionSet_t, uint32_t unSetCount);
 static PFN_UpdateActionState g_originalUpdateActionState = nullptr;
 static vr::VRActionSetHandle_t g_hDevActionSet = vr::k_ulInvalidActionSetHandle;
+
+static VTableHook g_getDigitalActionDataHook;
+using PFN_GetDigitalActionData = vr::EVRInputError(*)(void* thisPtr, vr::VRActionHandle_t action, vr::InputDigitalActionData_t* pActionData, uint32_t unActionDataSize, vr::VRInputValueHandle_t ulRestrictToDevice);
+static PFN_GetDigitalActionData g_originalGetDigitalActionData = nullptr;
+
+static VTableHook g_getAnalogActionDataHook;
+using PFN_GetAnalogActionData = vr::EVRInputError(*)(void* thisPtr, vr::VRActionHandle_t action, vr::InputAnalogActionData_t* pActionData, uint32_t unActionDataSize, vr::VRInputValueHandle_t ulRestrictToDevice);
+static PFN_GetAnalogActionData g_originalGetAnalogActionData = nullptr;
+
+// Set to true while CheckInputToggle() reads controller state so our own polling is never muted.
+static thread_local bool g_inModInputPoll = false;
+// Grace window (steady_clock ms) after closing/toggling the VR menu so releasing buttons never triggers game actions.
+static std::atomic<int64_t> g_blockGameInputUntilMs{ 0 };
+
+static int64_t SteadyNowMs() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void ExtendGameInputBlock(int64_t durationMs = 400) noexcept {
+    g_blockGameInputUntilMs.store(SteadyNowMs() + durationMs);
+}
+
+static bool ShouldBlockGameInput() noexcept {
+    return VRMenu::Instance().IsVisible() || (SteadyNowMs() < g_blockGameInputUntilMs.load());
+}
+
+static vr::EVRInputError Hooked_GetDigitalActionData(
+    void* thisPtr, vr::VRActionHandle_t action,
+    vr::InputDigitalActionData_t* pActionData, uint32_t unActionDataSize,
+    vr::VRInputValueHandle_t ulRestrictToDevice
+) {
+    vr::EVRInputError err = g_originalGetDigitalActionData
+        ? g_originalGetDigitalActionData(thisPtr, action, pActionData, unActionDataSize, ulRestrictToDevice)
+        : vr::VRInputError_None;
+    if (!g_inModInputPoll && pActionData && ShouldBlockGameInput()) {
+        pActionData->bState = false;
+        pActionData->bChanged = false;
+    }
+    return err;
+}
+
+static vr::EVRInputError Hooked_GetAnalogActionData(
+    void* thisPtr, vr::VRActionHandle_t action,
+    vr::InputAnalogActionData_t* pActionData, uint32_t unActionDataSize,
+    vr::VRInputValueHandle_t ulRestrictToDevice
+) {
+    vr::EVRInputError err = g_originalGetAnalogActionData
+        ? g_originalGetAnalogActionData(thisPtr, action, pActionData, unActionDataSize, ulRestrictToDevice)
+        : vr::VRInputError_None;
+    if (!g_inModInputPoll && pActionData && ShouldBlockGameInput()) {
+        pActionData->x = 0.0f;
+        pActionData->y = 0.0f;
+        pActionData->z = 0.0f;
+        pActionData->deltaX = 0.0f;
+        pActionData->deltaY = 0.0f;
+        pActionData->deltaZ = 0.0f;
+    }
+    return err;
+}
 
 static vr::EVRInputError Hooked_UpdateActionState(void* thisPtr, vr::VRActiveActionSet_t* pSets, uint32_t unSizeOfVRSelectedActionSet_t, uint32_t unSetCount) {
     if (g_pVRInput && g_hDevActionSet == vr::k_ulInvalidActionSetHandle) {
@@ -220,6 +282,9 @@ static bool LoadRealOpenVR() {
 
 static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t eyeWidth, uint32_t eyeHeight, DXGI_FORMAT format) {
     auto& eye = StereoPipeline::Instance().GetEye(eyeIdx);
+    if (D3D12Interop::Instance().IsInitialized()) {
+        D3D12Interop::Instance().WaitForGpu();
+    }
     DLSS5Bridge::Instance().ReleaseEyeFeature(eyeIdx);
     eye.Release();
 
@@ -229,6 +294,7 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
         HLX_ERROR("Failed to get D3D11 device from game texture for eye %u", eyeIdx);
         return false;
     }
+    HLX_INFO("[INIT] Eye %u: got D3D11 device", eyeIdx);
 
     hlx::Config config;
     config.Load();
@@ -247,6 +313,7 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
     if (g_pVRSystem) {
         float left = 0.0f, right = 0.0f, top = 0.0f, bottom = 0.0f;
         g_pVRSystem->GetProjectionRaw(static_cast<vr::EVREye>(eyeIdx), &left, &right, &top, &bottom);
+        HLX_INFO("[INIT] Eye %u: GetProjectionRaw -> L=%.3f R=%.3f T=%.3f B=%.3f", eyeIdx, left, right, top, bottom);
         if (std::isfinite(left) && std::isfinite(right) && std::isfinite(top) && std::isfinite(bottom) &&
             (right > left) && (bottom > top)) {
             // Asymmetric frustum optical axis calculation (OpenVR convention):
@@ -266,8 +333,8 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
     if (config.foveated) {
         foveaW = (static_cast<uint32_t>(fullW * config.foveated_width) + 7) & ~7u;
         foveaH = (static_cast<uint32_t>(fullH * config.foveated_height) + 7) & ~7u;
-        foveaW = (std::clamp)(foveaW, 64u, fullW);
-        foveaH = (std::clamp)(foveaH, 64u, fullH);
+        foveaW = (std::clamp)(foveaW, 32u, fullW);
+        foveaH = (std::clamp)(foveaH, 32u, fullH);
 
         int32_t optCenterX = static_cast<int32_t>(fullW * centerU);
         int32_t optCenterY = static_cast<int32_t>(fullH * centerV);
@@ -278,34 +345,65 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
         foveaY = static_cast<uint32_t>(std::clamp<int32_t>(startY_fovea, 0, static_cast<int32_t>(fullH - foveaH))) & ~1u;
     }
 
+    // Neural working size: the model cost scales with the evaluated area
+    // (measured GpuNr ~2.9 ms/eye at fovea size), so WorkingScale evaluates a
+    // smaller image and Matched Residual Composition transfers the residual onto
+    // full-res native pixels. When Passes > 1 (2 or 3 sequential layers), apply a
+    // gentle area compensation (0.78x for 2 passes, 0.66x for 3 passes) so multi-pass
+    // stays well inside the VR frame budget while preserving 100% native pixel sharpness.
+    const int numPasses = (std::clamp)(config.passes, 1, 3);
+    const float passScaleFactor = (numPasses <= 1) ? 1.0f : ((numPasses == 2) ? 0.78f : 0.66f);
+    const float effectiveScale = (std::clamp)(config.working_scale * passScaleFactor, 0.30f, 1.0f);
+    uint32_t workW = (static_cast<uint32_t>(static_cast<float>(foveaW) * effectiveScale) + 7) & ~7u;
+    uint32_t workH = (static_cast<uint32_t>(static_cast<float>(foveaH) * effectiveScale) + 7) & ~7u;
+    workW = (std::clamp)(workW, 32u, foveaW);
+    workH = (std::clamp)(workH, 32u, foveaH);
+
     eye.fullWidth = fullW;
     eye.fullHeight = fullH;
     eye.foveaX = foveaX;
     eye.foveaY = foveaY;
     eye.foveaWidth = foveaW;
     eye.foveaHeight = foveaH;
-    eye.width = foveaW;
-    eye.height = foveaH;
+    eye.centerU = centerU;
+    eye.centerV = centerV;
+    eye.lastDrsWidth = fullW;
+    eye.lastDrsHeight = fullH;
+    eye.width = workW;
+    eye.height = workH;
 
     DXGI_FORMAT unormFormat = (format == DXGI_FORMAT_R8G8B8A8_TYPELESS) ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
 
     // 1. Create Shared D3D11 Fovea Input Texture (size foveaW x foveaH)
     D3D11_TEXTURE2D_DESC td = {};
-    td.Width = foveaW;
-    td.Height = foveaH;
+    td.Width = workW;
+    td.Height = workH;
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = unormFormat;
     td.SampleDesc.Count = 1;
     td.SampleDesc.Quality = 0;
     td.Usage = D3D11_USAGE_DEFAULT;
+    const bool needsDownsample = (workW != foveaW) || (workH != foveaH);
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    if (needsDownsample) td.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
     td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
     HRESULT hr = d3d11Device->CreateTexture2D(&td, nullptr, &eye.sharedInputTex11);
     if (FAILED(hr)) {
         HLX_ERROR("Failed to create sharedInputTex11 for eye %u: 0x%08X", eyeIdx, hr);
         d3d11Device->Release();
         return false;
+    }
+    if (needsDownsample) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC iud = {};
+        iud.Format = unormFormat;
+        iud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        hr = d3d11Device->CreateUnorderedAccessView(eye.sharedInputTex11, &iud, &eye.inputUav11);
+        if (FAILED(hr)) {
+            HLX_ERROR("Failed to create inputUav11 for eye %u: 0x%08X", eyeIdx, hr);
+            d3d11Device->Release();
+            return false;
+        }
     }
 
     // 2. Create Shared D3D11 Fovea Output Texture (size foveaW x foveaH)
@@ -318,7 +416,7 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
         return false;
     }
 
-    // Create neural SRV on sharedOutputTex11 for the composite pass
+    // Create neural SRV on sharedOutputTex11 and input proxy SRV on sharedInputTex11 for Matched Residual Composite
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.Format = unormFormat;
     srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -327,11 +425,15 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
     if (FAILED(hr)) {
         HLX_ERROR("Failed to create neuralSrv11 for eye %u: 0x%08X", eyeIdx, hr);
     }
+    hr = d3d11Device->CreateShaderResourceView(eye.sharedInputTex11, &srvDesc, &eye.inputSrv11);
+    if (FAILED(hr)) {
+        HLX_ERROR("Failed to create inputSrv11 for eye %u: 0x%08X", eyeIdx, hr);
+    }
 
-    // 3. Create Full Native Capture Texture (size fullW x fullH)
+    // 3. Create Fovea Native Capture Texture (size foveaW x foveaH — avoids copying/compositing untouched periphery)
     D3D11_TEXTURE2D_DESC fullTd = {};
-    fullTd.Width = fullW;
-    fullTd.Height = fullH;
+    fullTd.Width = foveaW;
+    fullTd.Height = foveaH;
     fullTd.MipLevels = 1;
     fullTd.ArraySize = 1;
     fullTd.Format = unormFormat;
@@ -346,7 +448,7 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
         d3d11Device->CreateShaderResourceView(eye.fullNativeTex11, &srvDesc, &eye.nativeSrv11);
     }
 
-    // 4. Create Full Composited Destination Texture (size fullW x fullH)
+    // 4. Create Fovea Composited Destination Texture (size foveaW x foveaH)
     fullTd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
     hr = d3d11Device->CreateTexture2D(&fullTd, nullptr, &eye.fullCompositedTex11);
     if (FAILED(hr)) {
@@ -358,23 +460,45 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
         d3d11Device->CreateUnorderedAccessView(eye.fullCompositedTex11, &uavDesc, &eye.compositedUav11);
     }
 
-    // Initialize Foveated Composite Compute Shader
+    if (!eye.sharedInputTex11 || !eye.sharedOutputTex11 || !eye.nativeSrv11 || !eye.fullCompositedTex11 ||
+        !eye.compositedUav11 || (needsDownsample && !eye.inputUav11)) {
+        HLX_ERROR("Eye %u: incomplete D3D11 capture resources, aborting pipeline init", eyeIdx);
+        d3d11Device->Release();
+        return false;
+    }
+    HLX_INFO("[INIT] Eye %u: D3D11 capture resources ready", eyeIdx);
+
+    // Initialize Foveated Composite & fovea downsample compute shaders
     FoveatedCompositePass::Instance().Init(d3d11Device);
+    FoveaDownsamplePass::Instance().Init(d3d11Device);
 
     // 5. Open Shared Handles in D3D12
     IDXGIResource* resIn = nullptr;
-    eye.sharedInputTex11->QueryInterface(IID_PPV_ARGS(&resIn));
     HANDLE hIn = nullptr;
+    if (FAILED(eye.sharedInputTex11->QueryInterface(IID_PPV_ARGS(&resIn))) || !resIn) {
+        HLX_ERROR("Eye %u: sharedInputTex11 is not an IDXGIResource", eyeIdx);
+        d3d11Device->Release();
+        return false;
+    }
     resIn->GetSharedHandle(&hIn);
     resIn->Release();
 
     IDXGIResource* resOut = nullptr;
-    eye.sharedOutputTex11->QueryInterface(IID_PPV_ARGS(&resOut));
     HANDLE hOut = nullptr;
+    if (FAILED(eye.sharedOutputTex11->QueryInterface(IID_PPV_ARGS(&resOut))) || !resOut) {
+        HLX_ERROR("Eye %u: sharedOutputTex11 is not an IDXGIResource", eyeIdx);
+        d3d11Device->Release();
+        return false;
+    }
     resOut->GetSharedHandle(&hOut);
     resOut->Release();
 
     auto* d3d12Device = D3D12Interop::Instance().GetDevice();
+    if (!d3d12Device || !hIn || !hOut) {
+        HLX_ERROR("Eye %u: missing D3D12 device or shared handles (dev=%p, in=%p, out=%p)", eyeIdx, (void*)d3d12Device, hIn, hOut);
+        d3d11Device->Release();
+        return false;
+    }
     hr = d3d12Device->OpenSharedHandle(hIn, IID_PPV_ARGS(&eye.d3d12Input));
     if (FAILED(hr)) {
         HLX_ERROR("Failed to open shared input handle in D3D12 for eye %u: 0x%08X", eyeIdx, hr);
@@ -389,13 +513,13 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
         return false;
     }
 
-    // 6. Create Depth & Motion Resources in D3D12 (size foveaW x foveaH)
+    // 6. Create Depth & Motion Resources in D3D12 (same size as the evaluated color)
     D3D12_HEAP_PROPERTIES hpDefault = {};
     hpDefault.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rDesc = {};
     rDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rDesc.Width = foveaW;
-    rDesc.Height = foveaH;
+    rDesc.Width = workW;
+    rDesc.Height = workH;
     rDesc.DepthOrArraySize = 1;
     rDesc.MipLevels = 1;
     rDesc.SampleDesc.Count = 1;
@@ -406,6 +530,14 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
     rDesc.Format = DXGI_FORMAT_R32G32_FLOAT;
     d3d12Device->CreateCommittedResource(&hpDefault, D3D12_HEAP_FLAG_NONE, &rDesc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&eye.motionRes));
 
+    // Create D3D12 intermediate ping-pong texture for Multi-Pass (2 or 3 passes)
+    if (numPasses > 1) {
+        D3D12_RESOURCE_DESC intermDesc = rDesc;
+        intermDesc.Format = unormFormat;
+        intermDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        d3d12Device->CreateCommittedResource(&hpDefault, D3D12_HEAP_FLAG_NONE, &intermDesc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&eye.d3d12Interm));
+    }
+
     // 7. Initialize Cheeky-inspired D3D11 <-> D3D12 Shared Hardware Fence
     D3D12Interop::Instance().InitSharedFence(d3d11Device);
 
@@ -415,12 +547,14 @@ static bool InitEyePipeline(uint32_t eyeIdx, ID3D11Texture2D* pGameTex, uint32_t
     if (eye.cmdList) eye.cmdList->Close();
     eye.lastDoneValue = 0;
 
-    // 9. Create DLSS-NR Feature 18 for this eye at foveaW x foveaH
-    bool ok = DLSS5Bridge::Instance().CreateEyeFeature(eyeIdx, foveaW, foveaH);
+    HLX_INFO("[INIT] Eye %u: D3D12 interop + command list ready", eyeIdx);
+
+    // 9. Create DLSS-NR Feature 18 for this eye at workW x workH (scaled working resolution)
+    bool ok = DLSS5Bridge::Instance().CreateEyeFeature(eyeIdx, workW, workH);
     d3d11Device->Release();
 
-    HLX_INFO("Eye %u foveated pipeline initialized successfully (Full=%ux%u, Fovea=%ux%u @ (%u,%u), result=%d)",
-        eyeIdx, fullW, fullH, foveaW, foveaH, foveaX, foveaY, ok);
+    HLX_INFO("Eye %u foveated pipeline initialized successfully (Full=%ux%u, Fovea=%ux%u @ (%u,%u), Model=%ux%u, scale=%.2f [eff=%.2f], passes=%d, result=%d)",
+        eyeIdx, fullW, fullH, foveaW, foveaH, foveaX, foveaY, workW, workH, config.working_scale, effectiveScale, numPasses, ok);
     return ok;
 }
 
@@ -470,6 +604,22 @@ static std::atomic<uint32_t> g_borderFlashFrames{ 0 };
 using PFN_XInputGetState = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
 
 static void CheckInputToggle() {
+    // The input read below makes ~50 vrclient IPC calls. Polling them at 30 Hz
+    // instead of every eye keeps the shortcuts responsive while cutting our
+    // exposure to SteamVR's transient state during loads by ~3x.
+    static auto s_lastPoll = std::chrono::steady_clock::time_point{};
+    const auto pollNow = std::chrono::steady_clock::now();
+    if (s_lastPoll.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(pollNow - s_lastPoll).count() < 33) {
+        return;
+    }
+    s_lastPoll = pollNow;
+
+    struct ModInputPollScope {
+        ModInputPollScope() { g_inModInputPoll = true; }
+        ~ModInputPollScope() { g_inModInputPoll = false; }
+    } pollScope;
+
     static bool s_initializedState = false;
     if (!s_initializedState) {
         s_initializedState = true;
@@ -507,6 +657,8 @@ static void CheckInputToggle() {
     // Left Grip / Trigger tracking
     float leftGripPull = 0.0f;
     float leftTriggerPull = 0.0f;
+    bool leftUseGrip = false;
+    bool bSnapTurnEvent = false;
 
     // Left face buttons / capacitive touch tracking
     bool rawLeftDpadTouch = false;
@@ -515,6 +667,8 @@ static void CheckInputToggle() {
     bool bLeftLaserBtn = false;
     float leftThumbCurl = 0.0f;
     float skelThumbCurl = 0.0f;
+    float skelThumbCurlDevice = 0.0f;
+    float skelThumbCurlAnim = 0.0f;
     bool bLeftTeleportTouch = false;
     bool bLeftWalkTouch = false;
 
@@ -619,12 +773,14 @@ static void CheckInputToggle() {
             vr::InputDigitalActionData_t data = {};
             if (g_pVRInput->GetDigitalActionData(s_hTurnLeft, &data, sizeof(data), vr::k_ulInvalidInputValueHandle) == vr::VRInputError_None && data.bState) {
                 if (rightStickX > -0.5f) rightStickX = -0.8f;
+                if (data.bChanged) bSnapTurnEvent = true;
             }
         }
         if (s_hTurnRight != vr::k_ulInvalidActionHandle) {
             vr::InputDigitalActionData_t data = {};
             if (g_pVRInput->GetDigitalActionData(s_hTurnRight, &data, sizeof(data), vr::k_ulInvalidInputValueHandle) == vr::VRInputError_None && data.bState) {
                 if (rightStickX < 0.5f) rightStickX = 0.8f;
+                if (data.bChanged) bSnapTurnEvent = true;
             }
         }
         if (s_hAdjustHeight != vr::k_ulInvalidActionHandle) {
@@ -674,6 +830,12 @@ static void CheckInputToggle() {
                 if (data.x > leftGripPull) leftGripPull = data.x;
             }
         }
+        if (s_hUseGrip != vr::k_ulInvalidActionHandle) {
+            vr::InputDigitalActionData_t data = {};
+            if (g_pVRInput->GetDigitalActionData(s_hUseGrip, &data, sizeof(data), s_hLeftHand) == vr::VRInputError_None && data.bState) {
+                leftUseGrip = true;
+            }
+        }
         if (s_hTriggerPull != vr::k_ulInvalidActionHandle) {
             vr::InputAnalogActionData_t data = {};
             if (g_pVRInput->GetAnalogActionData(s_hTriggerPull, &data, sizeof(data), s_hLeftHand) == vr::VRInputError_None) {
@@ -717,15 +879,17 @@ static void CheckInputToggle() {
         if (s_hHandSkeletonLeft != vr::k_ulInvalidActionHandle) {
             vr::VRSkeletalSummaryData_t skelSummary = {};
             if (g_pVRInput->GetSkeletalSummaryData(s_hHandSkeletonLeft, vr::VRSummaryType_FromDevice, &skelSummary) == vr::VRInputError_None) {
-                if (skelSummary.flFingerCurl[vr::VRFinger_Thumb] > skelThumbCurl) {
-                    skelThumbCurl = skelSummary.flFingerCurl[vr::VRFinger_Thumb];
+                if (skelSummary.flFingerCurl[vr::VRFinger_Thumb] > skelThumbCurlDevice) {
+                    skelThumbCurlDevice = skelSummary.flFingerCurl[vr::VRFinger_Thumb];
                 }
             }
             if (g_pVRInput->GetSkeletalSummaryData(s_hHandSkeletonLeft, vr::VRSummaryType_FromAnimation, &skelSummary) == vr::VRInputError_None) {
-                if (skelSummary.flFingerCurl[vr::VRFinger_Thumb] > skelThumbCurl) {
-                    skelThumbCurl = skelSummary.flFingerCurl[vr::VRFinger_Thumb];
+                if (skelSummary.flFingerCurl[vr::VRFinger_Thumb] > skelThumbCurlAnim) {
+                    skelThumbCurlAnim = skelSummary.flFingerCurl[vr::VRFinger_Thumb];
                 }
             }
+            // Device sensor first: the animation summary follows the game's animated hand, not the real thumb.
+            skelThumbCurl = (skelThumbCurlDevice > 0.001f) ? skelThumbCurlDevice : skelThumbCurlAnim;
         }
 
         if (s_hTeleport != vr::k_ulInvalidActionHandle) {
@@ -760,7 +924,13 @@ static void CheckInputToggle() {
     uint64_t rawLeftTouchMask = 0;
     bool rawLeftStickTouch = false;
 
-    if (g_pVRSystem) {
+    // The legacy controller scan costs up to 45 IPC calls and is measured dead
+    // under SteamVR Input (zero [BTN-RAW] lines in every session: the masks are
+    // muted for apps with an action manifest). Keep it as a 3 Hz fallback only.
+    static uint32_t s_pollCount = 0;
+    const bool doLegacyScan = ((++s_pollCount % 10) == 0);
+
+    if (g_pVRSystem && doLegacyScan) {
         for (vr::TrackedDeviceIndex_t i = 1; i < 16; ++i) {
             if (!g_pVRSystem->IsTrackedDeviceConnected(i)) continue;
             vr::ETrackedDeviceClass devClass = g_pVRSystem->GetTrackedDeviceClass(i);
@@ -803,14 +973,11 @@ static void CheckInputToggle() {
                         leftThumbOnDpad = true;
                     }
 
-                    // Left analog joystick
+                    // Left analog joystick (rAxis[2] is the grip, never a stick axis)
                     float ax = state.rAxis[0].x;
                     float ay = state.rAxis[0].y;
                     if (std::abs(ax) > std::abs(leftStickX)) leftStickX = ax;
                     if (std::abs(ay) > std::abs(leftStickY)) leftStickY = ay;
-
-                    if (std::abs(state.rAxis[2].x) > std::abs(leftStickX)) leftStickX = state.rAxis[2].x;
-                    if (std::abs(state.rAxis[2].y) > std::abs(leftStickY)) leftStickY = state.rAxis[2].y;
 
                     if (state.ulButtonPressed & (1ULL << vr::k_EButton_Axis0)) {
                         leftStickClick = true;
@@ -822,14 +989,11 @@ static void CheckInputToggle() {
                         leftThumbOnDpad = true;
                     }
                 } else if (stateOk && isRight) {
-                    // Right analog joystick
+                    // Right analog joystick (rAxis[2] is the grip, never a stick axis)
                     float ax = state.rAxis[0].x;
                     float ay = state.rAxis[0].y;
                     if (std::abs(ax) > std::abs(rightStickX)) rightStickX = ax;
                     if (std::abs(ay) > std::abs(rightStickY)) rightStickY = ay;
-
-                    if (std::abs(state.rAxis[2].x) > std::abs(rightStickX)) rightStickX = state.rAxis[2].x;
-                    if (std::abs(state.rAxis[2].y) > std::abs(rightStickY)) rightStickY = state.rAxis[2].y;
 
                     if (state.ulButtonPressed & (1ULL << vr::k_EButton_Axis0)) {
                         rightStickClick = true;
@@ -892,31 +1056,42 @@ static void CheckInputToggle() {
         }
     }
 
-    // 1. Détection pouce sur joystick gauche vs pouce sur D-Pad gauche
-    // Le joystick gauche est actif si :
-    // - Le chapeau du joystick est touché capacitivement (bLeftTeleportTouch / rawLeftStickTouch)
-    // - Le joystick est cliqué (leftStickClick)
-    // - Le joystick est dévié de sa zone morte (std::abs > 0.20f)
-    // - L'action de marche est active (bLeftWalkTouch)
-    bool thumbOnLeftStick = bLeftTeleportTouch ||
-                            rawLeftStickTouch ||
-                            leftStickClick ||
-                            bLeftWalkTouch ||
-                            (std::abs(leftStickX) > 0.20f) ||
-                            (std::abs(leftStickY) > 0.20f);
+    // 1. Classify the left thumb: flat face area (arms shortcuts) vs joystick (never arms).
+    // In Alyx's manifest, no action reports the joystick cap touch, so a resting thumb is
+    // only visible through the skeletal thumb curl (measured: 0.41 on the stick cap, open
+    // hand 0.00-0.08 elsewhere). Stick click / deflection always override it.
+    hlx::LeftThumbSignals thumbSignals;
+    thumbSignals.faceButtonClicked = bToggleMenuBtn || bLeftHealthPenBtn || bLeftLaserBtn || rawLeftDpadTouch || leftThumbOnDpad;
+    thumbSignals.thumbCurl = skelThumbCurl;
+    thumbSignals.thumbCurlAnalog = leftThumbCurl;
+    thumbSignals.stickClicked = leftStickClick || bLeftWalkTouch;
+    thumbSignals.stickDeflected = bLeftTeleportTouch || rawLeftStickTouch;
+    thumbSignals.stickX = leftStickX;
+    thumbSignals.stickY = leftStickY;
 
-    // Le D-Pad gauche est touché si :
-    // - N'importe quel bouton de face gauche est pressé (X, Y, HealthPen, Laser, D-Pad d'action)
-    // - OU le pouce repose sur la face du contrôleur (tracking squelettique skelThumbCurl >= 0.12f)
-    bool leftDpadTouched = (bToggleMenuBtn || bLeftHealthPenBtn || bLeftLaserBtn || rawLeftDpadTouch || leftThumbOnDpad) ||
-                           (skelThumbCurl >= 0.12f) ||
-                           (leftThumbCurl >= 0.40f);
+    hlx::LeftThumbState thumbState = hlx::ClassifyLeftThumb(thumbSignals);
+    bool thumbOnLeftStick = thumbState.onStick;
+    bool leftDpadTouched = thumbState.onFacePlate;
+
+    // Reset temporal neural history on Snap Turn or Teleport completion so 1-frame camera jumps never ghost
+    static bool s_wasTeleporting = false;
+    bool teleportCompleted = (s_wasTeleporting && !bLeftTeleportTouch);
+    s_wasTeleporting = bLeftTeleportTouch;
+    if ((bSnapTurnEvent || teleportCompleted) && !VRMenu::Instance().IsVisible()) {
+        StereoPipeline::Instance().ResetAllEyesHistory();
+    }
 
     // 2. Evaluator instantiation & input feeding
     static hlx::InputComboEvaluator s_comboEvaluator;
     hlx::ControllerInputs inputs;
     inputs.leftDpadTouched = leftDpadTouched;
+    inputs.leftFaceBtnHeld = bLeftHealthPenBtn || bLeftLaserBtn;
     inputs.thumbOnLeftStick = thumbOnLeftStick;
+    inputs.leftStickX = leftStickX;
+    inputs.leftStickY = leftStickY;
+    inputs.leftGripPull = leftGripPull;
+    inputs.leftUseGrip = leftUseGrip;
+    inputs.leftTriggerPull = leftTriggerPull;
     inputs.rightGripPull = rightGripPull;
     inputs.rightTriggerPull = rightTriggerPull;
     inputs.rightUseGrip = rightUseGrip;
@@ -939,31 +1114,62 @@ static void CheckInputToggle() {
     auto now = std::chrono::steady_clock::now();
     auto comboOut = s_comboEvaluator.Evaluate(inputs, now);
 
+    if (comboOut.longPressHalfwayBeep) {
+        ExtendGameInputBlock(2000);
+        std::thread([]() {
+            Beep(950, 25);
+        }).detach();
+    }
+
     // Periodic diagnostic probe logger
     static auto s_lastProbeLog = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastProbeLog).count() > 400) {
-        float maxRightMajeur = (std::max)(rightGripPull, rightTriggerPull);
         bool validLeftDpad = leftDpadTouched && !thumbOnLeftStick;
-        if (leftDpadTouched || thumbOnLeftStick || maxRightMajeur > 0.20f || std::abs(rightStickY) > 0.20f) {
+        bool gripPressed = (rightGripPull >= 0.70f) || rightUseGrip;
+        bool triggerPressed = rightTriggerPull >= 0.70f;
+        if (leftDpadTouched || thumbOnLeftStick || gripPressed || triggerPressed || skelThumbCurl > 0.05f || std::abs(rightStickY) > 0.20f) {
             s_lastProbeLog = now;
-            HLX_INFO("[VRINPUT-PROBE] ValidDPadG=%d (Skel=%.2f, ThumbOnStick=%d, TeleTouch=%d, LStickY=%.2f) | MajD=%d (Grip=%.2f) | StickDHaut=%d (Y=%.2f) | Visible=%d",
-                (int)validLeftDpad, skelThumbCurl, (int)thumbOnLeftStick, (int)bLeftTeleportTouch, leftStickY,
-                (int)(maxRightMajeur >= 0.70f || rightUseGrip), rightGripPull,
+            HLX_INFO("[VRINPUT-PROBE] ValidDPadG=%d (DevCurl=%.2f AnimCurl=%.2f Used=%.2f, Stick=%d, LStickY=%.2f) | GripD=%.2f (%d) TrigD=%.2f (%d) StickDHaut=%d (Y=%.2f) | Menu=%d Toggle=%d | Visible=%d",
+                (int)validLeftDpad, skelThumbCurlDevice, skelThumbCurlAnim, skelThumbCurl, (int)thumbOnLeftStick, leftStickY,
+                rightGripPull, (int)gripPressed, rightTriggerPull, (int)triggerPressed,
                 (int)(rightStickY > 0.40f), rightStickY,
+                (int)comboOut.triggerMenuToggle, (int)comboOut.triggerDlssToggle,
                 (int)VRMenu::Instance().IsVisible());
         }
     }
 
-    // Process Quick Silent Toggle (D-Pad Gauche + Majeur Droit >= 70%)
+    // F9: capture 120 consecutive frames of raw left-thumb signals for calibration.
+    // Hold the pose (thumb on the plate, then on the joystick) and compare the logs.
+    static bool s_f9WasDown = false;
+    static int s_captureFrames = 0;
+    bool f9Down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (f9Down && !s_f9WasDown && s_captureFrames == 0) {
+        s_captureFrames = 120;
+        Beep(1200, 60);
+        HLX_INFO("--- [CAPTURE] START (hold one pose for ~1.5s) ---");
+    }
+    s_f9WasDown = f9Down;
+    if (s_captureFrames > 0) {
+        s_captureFrames--;
+        HLX_INFO("[CAPTURE] %s Dev=%.3f Anim=%.3f Stick=%d Click=%d Defl=%d LStick=(%.2f,%.2f)",
+            thumbState.onFacePlate ? "PLATE" : (thumbState.onStick ? "STICK" : "NONE"),
+            skelThumbCurlDevice, skelThumbCurlAnim, (int)thumbState.onStick,
+            (int)leftStickClick, (int)bLeftTeleportTouch, leftStickX, leftStickY);
+        if (s_captureFrames == 0) HLX_INFO("--- [CAPTURE] END ---");
+    }
+
+    // Process Quick Silent Toggle (D-Pad/X Gauche + Majeur Droit >= 70% ou F7)
     if (comboOut.triggerDlssToggle) {
         bool newState = !g_dlss5UserActive.load();
         g_dlss5UserActive.store(newState);
+        StereoPipeline::Instance().ResetAllEyesHistory();
 
         // Explicitly hide menu and suppress green border / circle
         VRMenu::Instance().Hide(g_pVROverlay);
+        ExtendGameInputBlock(450);
         g_borderFlashFrames.store(0);
 
-        HLX_INFO(">>> [USER-QUICK-TOGGLE] DLSS 5 Neural Reconstruction is now: %s (Silent: No Menu, No Border) [Combo: Pouce G D-Pad + Majeur D Grip >= 70%%] <<<",
+        HLX_INFO(">>> [USER-QUICK-TOGGLE] DLSS 5 Neural Reconstruction is now: %s (Silent: No Menu, No Border) <<<",
             newState ? "ENABLED" : "DISABLED (BYPASS)");
 
         std::thread([newState]() {
@@ -977,11 +1183,12 @@ static void CheckInputToggle() {
         return; // Suppress any navigation on the exact toggle frame
     }
 
-    // Process Menu Visibility Toggle (D-Pad Gauche + Joystick Droit vers le haut)
+    // Process Menu Visibility Toggle (3s Hold X/Grips, Left X/D-Pad + Right Trigger, or F8/F11)
     if (comboOut.triggerMenuToggle) {
         VRMenu::Instance().Toggle(g_pVROverlay);
-        HLX_INFO(">>> [USER-MENU] DLSS 5 Settings Menu toggled [Combo: Pouce G D-Pad + Stick Droit Haut] (Visible: %d) <<<",
-            (int)VRMenu::Instance().IsVisible());
+        ExtendGameInputBlock(500);
+        HLX_INFO(">>> [USER-MENU] DLSS 5 Settings Menu toggled (Visible: %d, Game Inputs Blocked: %d) <<<",
+            (int)VRMenu::Instance().IsVisible(), (int)ShouldBlockGameInput());
 
         std::thread([]() {
             Beep(1400, 50);
@@ -990,16 +1197,19 @@ static void CheckInputToggle() {
         return; // Suppress any navigation on the exact toggle frame
     }
 
-    // Grace period: While the left D-pad is touched, completely ignore navigation!
-    bool inComboGracePeriod = leftDpadTouched;
+    // Grace period: While the left D-pad or left X button is held for a combo, ignore menu navigation
+    bool inComboGracePeriod = leftDpadTouched || bLeftHealthPenBtn || bLeftLaserBtn;
     if (inComboGracePeriod) {
         return;
     }
 
     // When VRMenu is visible and not in toggle grace period, process navigation & slider adjustments
+    // Game controls are 100% blocked via Hooked_GetDigitalActionData / Hooked_GetAnalogActionData!
     if (VRMenu::Instance().IsVisible()) {
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+        ExtendGameInputBlock(450);
+        if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) || bToggleMenuBtn) {
             VRMenu::Instance().Hide(g_pVROverlay);
+            ExtendGameInputBlock(500);
             return;
         }
 
@@ -1064,6 +1274,53 @@ static void CheckInputToggle() {
     }
 }
 
+// Set while we are inside the real compositor Submit, so the SEH handler knows
+// whether the fault came from our own preprocessing or from SteamVR itself.
+static thread_local bool g_inOriginalSubmit = false;
+// Set after any SEH fault: DLSS processing is permanently disabled (vanilla
+// passthrough) so a broken pipeline can never fault again every frame.
+static std::atomic<bool> g_pipelineFaulted{ false };
+
+static vr::EVRCompositorError SubmitOriginal(
+    void* thisPtr, vr::EVREye eEye, const vr::Texture_t* pTexture,
+    const vr::VRTextureBounds_t* pBounds, vr::EVRSubmitFlags nSubmitFlags) {
+    if (!g_originalSubmit) return vr::VRCompositorError_None;
+    g_inOriginalSubmit = true;
+    vr::EVRCompositorError err = g_originalSubmit(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
+    g_inOriginalSubmit = false;
+    return err;
+}
+
+static int LogSehAndContinue(EXCEPTION_POINTERS* ep) {
+    const EXCEPTION_RECORD* rec = ep ? ep->ExceptionRecord : nullptr;
+    const uintptr_t pc = rec ? reinterpret_cast<uintptr_t>(rec->ExceptionAddress) : 0;
+    const uintptr_t fault = (rec && rec->NumberParameters > 1) ? static_cast<uintptr_t>(rec->ExceptionInformation[1]) : 0;
+
+    auto describe = [](uintptr_t addr, wchar_t* buf, size_t bufCount, unsigned long long* offset) {
+        buf[0] = 0;
+        *offset = 0;
+        if (!addr) return;
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(addr), &mod) && mod) {
+            GetModuleFileNameW(mod, buf, static_cast<DWORD>(bufCount));
+            *offset = addr - reinterpret_cast<uintptr_t>(mod);
+        }
+    };
+
+    wchar_t pcMod[MAX_PATH] = {}, faultMod[MAX_PATH] = {};
+    unsigned long long pcOff = 0, faultOff = 0;
+    describe(pc, pcMod, MAX_PATH, &pcOff);
+    describe(fault, faultMod, MAX_PATH, &faultOff);
+
+    HLX_ERROR("SEH 0x%08X at %p (%ls+0x%llX) | fault addr 0x%llX (%ls+0x%llX) | inside original Submit=%d",
+        rec ? rec->ExceptionCode : 0, reinterpret_cast<void*>(pc), pcMod, pcOff,
+        static_cast<unsigned long long>(fault), faultMod, faultOff, (int)g_inOriginalSubmit);
+    g_pipelineFaulted.store(true);
+    Logger::Instance().Flush();  // the process may die here: make sure the line is on disk
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 // Internal implementation of Submit
 static vr::EVRCompositorError Hooked_Submit_Impl(
     void* thisPtr,
@@ -1089,8 +1346,9 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
 
     if (!loggedFirstEye[eyeIdx]) {
         loggedFirstEye[eyeIdx] = true;
-        HLX_INFO("Hooked_Submit first call for Eye %u (Type=%d, ColorSpace=%d, Handle=%p)",
-            eyeIdx, pTexture ? pTexture->eType : -1, pTexture ? pTexture->eColorSpace : -1, pTexture ? pTexture->handle : nullptr);
+        HLX_INFO("Hooked_Submit first call for Eye %u (Type=%d, ColorSpace=%d, Handle=%p, SubmitFlags=0x%X)",
+            eyeIdx, pTexture ? pTexture->eType : -1, pTexture ? pTexture->eColorSpace : -1,
+            pTexture ? pTexture->handle : nullptr, (unsigned)nSubmitFlags);
         if (pBounds) {
             HLX_INFO("Hooked_Submit Bounds for Eye %u: (uMin=%.3f, vMin=%.3f, uMax=%.3f, vMax=%.3f)",
                 eyeIdx, pBounds->uMin, pBounds->vMin, pBounds->uMax, pBounds->vMax);
@@ -1098,10 +1356,16 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
     }
 
     const auto& config = StereoPipeline::Instance().GetConfig();
-    bool dlssActive = config.enabled && g_dlss5UserActive.load();
+    bool zeroZone = config.foveated && (config.foveated_width <= 0.005f || config.foveated_height <= 0.005f);
+    bool dlssActive = config.enabled && g_dlss5UserActive.load() && !zeroZone;
 
     if (eyeIdx == 0) {
+        GazeTracker::Instance().PollFrameGaze(g_pVRSystem, config);
         VRMenu::Instance().UpdateOverlay(g_pVROverlay, config);
+    }
+
+    if (g_pipelineFaulted.load()) {
+        return SubmitOriginal(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
     }
 
     if (dlssActive && pTexture && pTexture->handle && (pTexture->eType == vr::TextureType_DirectX)) {
@@ -1166,27 +1430,55 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
                 } else {
                     // Still in startup loading diorama: forward cleanly to SteamVR
                     if (g_originalSubmit) {
-                        return g_originalSubmit(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
+                        return SubmitOriginal(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
                     }
                     return vr::VRCompositorError_None;
                 }
             }
 
-            // Once initialized, if the game experiences a temporary DRS change from target resolution,
-            // pass it through without destroying Feature 18, preventing GPU allocation stalls.
-            if (eye.isInitialized && (eyeWidth != eye.fullWidth || eyeHeight != eye.fullHeight)) {
-                if (g_originalSubmit) {
-                    return g_originalSubmit(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
+            // Once initialized, support Source 2 Dynamic Resolution Scaling (DRS) seamlessly without
+            // disabling DLSS 5 or reallocating Feature 18: as long as the current DRS eye viewport fits
+            // our fixed fovea sweetspot (foveaWidth x foveaHeight), recenter the fovea subrect on the
+            // current viewport's optical axis!
+            if (eye.isInitialized) {
+                if (eyeWidth < eye.foveaWidth || eyeHeight < eye.foveaHeight ||
+                    (!config.foveated && (eyeWidth != eye.fullWidth || eyeHeight != eye.fullHeight))) {
+                    if (g_originalSubmit) {
+                        return SubmitOriginal(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
+                    }
+                    return vr::VRCompositorError_None;
                 }
-                return vr::VRCompositorError_None;
+                if (config.foveated) {
+                    const auto placement = GazeTracker::Instance().ResolveEyePlacement(
+                        eyeIdx, eyeWidth, eyeHeight,
+                        eye.foveaWidth, eye.foveaHeight,
+                        eye.centerU, eye.centerV, config
+                    );
+                    eye.foveaX = placement.foveaX;
+                    eye.foveaY = placement.foveaY;
+                    if (placement.needsHistoryReset) {
+                        eye.needsReset = true;
+                    }
+                }
+                if (eyeWidth != eye.lastDrsWidth || eyeHeight != eye.lastDrsHeight) {
+                    eye.lastDrsWidth = eyeWidth;
+                    eye.lastDrsHeight = eyeHeight;
+                    eye.needsReset = true;
+                }
             }
 
             if (eye.isInitialized && eye.sharedInputTex11 && eye.sharedOutputTex11 && eye.fullNativeTex11 && eye.fullCompositedTex11) {
                 auto startTotal = std::chrono::high_resolution_clock::now();
 
-                // Engine render time tracking: measure time elapsed since previous Submit ended
+                // Engine frame time: eye 0 to eye 0, so the DLSS path stays comparable with the
+                // vanilla path in [CADENCE-1SEC] (a per-eye delta would report half a frame).
                 static auto s_lastSubmitEnd = std::chrono::high_resolution_clock::now();
-                double engineMs = std::chrono::duration<double, std::milli>(startTotal - s_lastSubmitEnd).count();
+                static auto s_lastFrameStart = std::chrono::high_resolution_clock::now();
+                double engineMs = 0.0;
+                if (eyeIdx == 0) {
+                    engineMs = std::chrono::duration<double, std::milli>(startTotal - s_lastFrameStart).count();
+                    s_lastFrameStart = startTotal;
+                }
 
                 ID3D11Device* d3d11Device = nullptr;
                 pGameTex->GetDevice(&d3d11Device);
@@ -1195,29 +1487,22 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
                     d3d11Device->GetImmediateContext(&d3d11Context);
                 }
 
+                if (d3d11Device) {
+                    GpuTimers::Instance().Init(d3d11Device);
+                }
+                if (d3d11Context) {
+                    GpuTimers::Instance().TryCollect(d3d11Context, static_cast<int>(eyeIdx));
+                }
+
                 auto t0 = std::chrono::high_resolution_clock::now();
                 if (d3d11Context) {
+                    GpuTimers::Instance().Begin(d3d11Context, static_cast<int>(eyeIdx));
                     // Unbind active render targets to prevent D3D11 copy hazards and allow compositor read access
                     ID3D11RenderTargetView* nullRTV[8] = { nullptr };
                     d3d11Context->OMSetRenderTargets(8, nullRTV, nullptr);
 
-                    // 1. Copy full native eye into fullNativeTex11
-                    D3D11_BOX nativeBox = {};
-                    nativeBox.left = startX;
-                    nativeBox.top = startY;
-                    nativeBox.front = 0;
-                    nativeBox.right = startX + eye.fullWidth;
-                    nativeBox.bottom = startY + eye.fullHeight;
-                    nativeBox.back = 1;
-
-                    d3d11Context->CopySubresourceRegion(
-                        eye.fullNativeTex11, 0,
-                        0, 0, 0,
-                        pGameTex, 0,
-                        &nativeBox
-                    );
-
-                    // 2. Copy foveated sweetspot subrect into sharedInputTex11
+                    // 1. Copy only the foveated sweetspot subrect into fullNativeTex11 (foveaWidth x foveaHeight)
+                    //    Periphery outside foveaBox remains untouched in pGameTex, cutting copy & composite cost by ~70%
                     D3D11_BOX foveaBox = {};
                     foveaBox.left = startX + eye.foveaX;
                     foveaBox.top = startY + eye.foveaY;
@@ -1227,11 +1512,34 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
                     foveaBox.back = 1;
 
                     d3d11Context->CopySubresourceRegion(
-                        eye.sharedInputTex11, 0,
+                        eye.fullNativeTex11, 0,
                         0, 0, 0,
                         pGameTex, 0,
                         &foveaBox
                     );
+
+                    // 2. Populate sharedInputTex11 (workW x workH) via copy (scale=1.0) or area-weighted box downsample
+                    if (eye.width == eye.foveaWidth && eye.height == eye.foveaHeight) {
+                        d3d11Context->CopySubresourceRegion(
+                            eye.sharedInputTex11, 0,
+                            0, 0, 0,
+                            pGameTex, 0,
+                            &foveaBox
+                        );
+                    } else {
+                        FoveaDownsampleConstants dsConsts = {};
+                        dsConsts.srcBaseX = 0;
+                        dsConsts.srcBaseY = 0;
+                        dsConsts.srcWidth = eye.foveaWidth;
+                        dsConsts.srcHeight = eye.foveaHeight;
+                        dsConsts.dstWidth = eye.width;
+                        dsConsts.dstHeight = eye.height;
+                        FoveaDownsamplePass::Instance().Execute(
+                            d3d11Context, eye.nativeSrv11, eye.inputUav11, dsConsts);
+                    }
+                }
+                if (d3d11Context) {
+                    GpuTimers::Instance().Mark(d3d11Context, static_cast<int>(eyeIdx), 1);
                 }
                 auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -1279,16 +1587,18 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
                         // 5. D3D11 waits for D3D12 on GPU
                         ctx11_4->Wait(d3d12.GetD3D11Fence(), doneVal);
 
-                        // 6. D3D11 Foveated Compositing: blend native periphery and neural sweetspot
+                        GpuTimers::Instance().Mark(d3d11Context, static_cast<int>(eyeIdx), 2);
+
+                        // 6. D3D11 Foveated Compositing: Matched Residual Transfer over fovea subrect only
                         FoveatedConstants fovConsts = {};
-                        fovConsts.outputWidth = eye.fullWidth;
-                        fovConsts.outputHeight = eye.fullHeight;
-                        fovConsts.foveaBaseX = eye.foveaX;
-                        fovConsts.foveaBaseY = eye.foveaY;
+                        fovConsts.outputWidth = eye.foveaWidth;
+                        fovConsts.outputHeight = eye.foveaHeight;
+                        fovConsts.foveaBaseX = 0;
+                        fovConsts.foveaBaseY = 0;
                         fovConsts.foveaWidth = eye.foveaWidth;
                         fovConsts.foveaHeight = eye.foveaHeight;
-                        fovConsts.neuralWidth = eye.foveaWidth;
-                        fovConsts.neuralHeight = eye.foveaHeight;
+                        fovConsts.neuralWidth = eye.width;
+                        fovConsts.neuralHeight = eye.height;
                         fovConsts.foveaRoundness = config.foveated_roundness;
                         fovConsts.featherWidth = config.foveated_feather;
                         fovConsts.foveatedEnabled = config.foveated ? 1 : 0;
@@ -1305,21 +1615,22 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
                             eye.nativeSrv11,
                             eye.neuralSrv11,
                             eye.compositedUav11,
-                            fovConsts
+                            fovConsts,
+                            eye.inputSrv11
                         );
 
-                        // 7. Copy final seamlessly blended full eye back into pGameTex
+                        // 7. Copy composited fovea subrect back into pGameTex at (startX + foveaX, startY + foveaY)
                         D3D11_BOX outBox = {};
                         outBox.left = 0;
                         outBox.top = 0;
                         outBox.front = 0;
-                        outBox.right = eye.fullWidth;
-                        outBox.bottom = eye.fullHeight;
+                        outBox.right = eye.foveaWidth;
+                        outBox.bottom = eye.foveaHeight;
                         outBox.back = 1;
 
                         d3d11Context->CopySubresourceRegion(
                             pGameTex, 0,
-                            startX, startY, 0,
+                            startX + eye.foveaX, startY + eye.foveaY, 0,
                             eye.fullCompositedTex11, 0,
                             &outBox
                         );
@@ -1332,17 +1643,20 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
                     evaluated = DLSS5Bridge::Instance().EvaluateEye(eyeIdx);
                     if (evaluated) {
                         d3d12.ExecuteAndSync();
+                        if (d3d11Context) {
+                            GpuTimers::Instance().Mark(d3d11Context, static_cast<int>(eyeIdx), 2);
+                        }
 
                         if (d3d11Context) {
                             FoveatedConstants fovConsts = {};
-                            fovConsts.outputWidth = eye.fullWidth;
-                            fovConsts.outputHeight = eye.fullHeight;
-                            fovConsts.foveaBaseX = eye.foveaX;
-                            fovConsts.foveaBaseY = eye.foveaY;
+                            fovConsts.outputWidth = eye.foveaWidth;
+                            fovConsts.outputHeight = eye.foveaHeight;
+                            fovConsts.foveaBaseX = 0;
+                            fovConsts.foveaBaseY = 0;
                             fovConsts.foveaWidth = eye.foveaWidth;
                             fovConsts.foveaHeight = eye.foveaHeight;
-                            fovConsts.neuralWidth = eye.foveaWidth;
-                            fovConsts.neuralHeight = eye.foveaHeight;
+                            fovConsts.neuralWidth = eye.width;
+                            fovConsts.neuralHeight = eye.height;
                             fovConsts.foveaRoundness = config.foveated_roundness;
                             fovConsts.featherWidth = config.foveated_feather;
                             fovConsts.foveatedEnabled = config.foveated ? 1 : 0;
@@ -1359,26 +1673,30 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
                                 eye.nativeSrv11,
                                 eye.neuralSrv11,
                                 eye.compositedUav11,
-                                fovConsts
+                                fovConsts,
+                                eye.inputSrv11
                             );
 
                             D3D11_BOX outBox = {};
                             outBox.left = 0;
                             outBox.top = 0;
                             outBox.front = 0;
-                            outBox.right = eye.fullWidth;
-                            outBox.bottom = eye.fullHeight;
+                            outBox.right = eye.foveaWidth;
+                            outBox.bottom = eye.foveaHeight;
                             outBox.back = 1;
 
                             d3d11Context->CopySubresourceRegion(
                                 pGameTex, 0,
-                                startX, startY, 0,
+                                startX + eye.foveaX, startY + eye.foveaY, 0,
                                 eye.fullCompositedTex11, 0,
                                 &outBox
                             );
                             d3d11Context->Flush();
                         }
                     }
+                }
+                if (d3d11Context) {
+                    GpuTimers::Instance().End(d3d11Context, static_cast<int>(eyeIdx));
                 }
                 auto t_sync1 = std::chrono::high_resolution_clock::now();
 
@@ -1401,7 +1719,7 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
                 auto t_sub0 = std::chrono::high_resolution_clock::now();
                 vr::EVRCompositorError err = vr::VRCompositorError_None;
                 if (g_originalSubmit) {
-                    err = g_originalSubmit(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
+                    err = SubmitOriginal(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
                     if (err != vr::VRCompositorError_None) {
                         static uint32_t s_submitErrCount = 0;
                         if (++s_submitErrCount <= 10) {
@@ -1451,13 +1769,17 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
                     double avgTotal = s_cadenceEyeCount > 0 ? (s_cadenceTotalSum / s_cadenceEyeCount) : 0.0;
                     double avgDlss = s_cadenceEyeCount > 0 ? (s_cadenceDlssSum / s_cadenceEyeCount) : 0.0;
                     double avgSubmit = s_cadenceEyeCount > 0 ? (s_cadenceSubmitSum / s_cadenceEyeCount) : 0.0;
-                    double avgEngine = s_cadenceEyeCount > 0 ? (s_cadenceEngineSum / s_cadenceEyeCount) : 0.0;
+                    const double frames = (std::max)(1.0, s_cadenceEyeCount / 2.0);
+                    double avgEngine = s_cadenceEngineSum / frames;
+                    double gpu[3] = {};
+                    GpuTimers::Instance().Consume(gpu);
                     double estimatedStereoMs = (avgTotal * 2.0) + avgEngine;
                     bool locked90 = (estimatedStereoMs <= 11.11);
 
-                    HLX_INFO("[CADENCE-1SEC] StereoFPS=%.1f | EyeAvg=%.2f ms (Max=%.2f ms) | EngineAvg=%.2f ms | DlssNrAvg=%.2f ms | VRSubmitAvg=%.2f ms | StereoEst=%.2f ms [%s] | Spikes (>10ms)=%u | Size=%ux%u",
+                    HLX_INFO("[CADENCE-1SEC] Dlss=ON StereoFPS=%.1f | EyeAvg=%.2f ms (Max=%.2f ms) | EngineAvg=%.2f ms | DlssNrAvg=%.2f ms | VRSubmitAvg=%.2f ms | StereoEst=%.2f ms [%s] | GpuIn=%.2f GpuNr=%.2f GpuOut=%.2f ms/eye | Spikes (>10ms)=%u | Size=%ux%u",
                         stereoFps, avgTotal, s_cadenceMaxTotal, avgEngine, avgDlss, avgSubmit, estimatedStereoMs,
-                        locked90 ? "90Hz LOCKED" : "THROTTLED/REPROJECT", s_cadenceSpikes, eyeWidth, eyeHeight);
+                        locked90 ? "90Hz LOCKED" : "THROTTLED/REPROJECT", gpu[0], gpu[1], gpu[2],
+                        s_cadenceSpikes, eyeWidth, eyeHeight);
 
                     s_lastCadenceSec = nowSec;
                     s_cadenceEyeCount = 0;
@@ -1473,9 +1795,30 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
             }
         }
 
+    // Vanilla (DLSS off) cadence: same per-second line as the DLSS path, so ON vs OFF
+    // can be compared from the log alone instead of an external GPU overlay.
+    static auto s_vanillaPrevEye0 = std::chrono::high_resolution_clock::now();
+    static auto s_vanillaLastLog = std::chrono::high_resolution_clock::now();
+    static double s_vanillaEngineSum = 0.0;
+    static uint32_t s_vanillaFrames = 0;
+    if (eyeIdx == 0 && !dlssActive) {
+        auto nowT = std::chrono::high_resolution_clock::now();
+        s_vanillaEngineSum += std::chrono::duration<double, std::milli>(nowT - s_vanillaPrevEye0).count();
+        s_vanillaPrevEye0 = nowT;
+        s_vanillaFrames++;
+        double elapsed = std::chrono::duration<double>(nowT - s_vanillaLastLog).count();
+        if (elapsed >= 1.0) {
+            double avgEngine = s_vanillaFrames > 0 ? s_vanillaEngineSum / s_vanillaFrames : 0.0;
+            HLX_INFO("[CADENCE-1SEC] Dlss=OFF StereoFPS=%.1f | EngineAvg=%.2f ms", s_vanillaFrames / elapsed, avgEngine);
+            s_vanillaLastLog = nowT;
+            s_vanillaFrames = 0;
+            s_vanillaEngineSum = 0.0;
+        }
+    }
+
     // Forward to original Submit and capture error code
     if (g_originalSubmit) {
-        vr::EVRCompositorError err = g_originalSubmit(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
+        vr::EVRCompositorError err = SubmitOriginal(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
         if (err != vr::VRCompositorError_None) {
             static uint32_t errCount = 0;
             if (++errCount <= 10) {
@@ -1495,13 +1838,12 @@ static vr::EVRCompositorError Hooked_Submit(
     const vr::VRTextureBounds_t* pBounds,
     vr::EVRSubmitFlags nSubmitFlags
 ) {
-    uint32_t eyeIdx = (eEye == vr::Eye_Right) ? 1 : 0;
     __try {
         return Hooked_Submit_Impl(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
-    } __except (HLX_ERROR("SEH Exception 0x%08X in Hooked_Submit for Eye %u!", GetExceptionCode(), eyeIdx), EXCEPTION_EXECUTE_HANDLER) {
-        if (g_originalSubmit) {
-            return g_originalSubmit(thisPtr, eEye, pTexture, pBounds, nSubmitFlags);
-        }
+    } __except (LogSehAndContinue(GetExceptionInformation())) {
+        // Never re-enter the compositor after a fault: the eye is skipped for this
+        // frame and every later frame takes the plain vanilla passthrough path.
+        (void)g_inOriginalSubmit;
         return vr::VRCompositorError_None;
     }
 }
@@ -1553,6 +1895,8 @@ __declspec(dllexport) uint32_t VR_InitInternal2(vr::EVRInitError *peError, vr::E
 __declspec(dllexport) void VR_ShutdownInternal() {
     HLX_INFO("VR_ShutdownInternal called");
     hlx::g_submitHook.Restore();
+    hlx::g_getAnalogActionDataHook.Restore();
+    hlx::g_getDigitalActionDataHook.Restore();
     hlx::g_updateActionStateHook.Restore();
     hlx::g_renderTargetHook.Restore();
     hlx::StereoPipeline::Instance().Shutdown();
@@ -1612,6 +1956,26 @@ __declspec(dllexport) void* VR_GetGenericInterface(const char *pchInterfaceVersi
                     reinterpret_cast<void**>(&hlx::g_originalUpdateActionState)
                 );
                 HLX_INFO("Successfully hooked IVRInput::UpdateActionState at slot 4!");
+            }
+            if (vtable && !hlx::g_getDigitalActionDataHook.IsInstalled()) {
+                // GetDigitalActionData is slot 5 in IVRInput vtable
+                void** digitalSlot = &vtable[5];
+                hlx::g_getDigitalActionDataHook.Install(
+                    digitalSlot,
+                    reinterpret_cast<void*>(&hlx::Hooked_GetDigitalActionData),
+                    reinterpret_cast<void**>(&hlx::g_originalGetDigitalActionData)
+                );
+                HLX_INFO("Successfully hooked IVRInput::GetDigitalActionData at slot 5!");
+            }
+            if (vtable && !hlx::g_getAnalogActionDataHook.IsInstalled()) {
+                // GetAnalogActionData is slot 6 in IVRInput vtable
+                void** analogSlot = &vtable[6];
+                hlx::g_getAnalogActionDataHook.Install(
+                    analogSlot,
+                    reinterpret_cast<void*>(&hlx::Hooked_GetAnalogActionData),
+                    reinterpret_cast<void**>(&hlx::g_originalGetAnalogActionData)
+                );
+                HLX_INFO("Successfully hooked IVRInput::GetAnalogActionData at slot 6!");
             }
         }
 

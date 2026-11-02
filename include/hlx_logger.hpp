@@ -112,7 +112,18 @@ public:
             // Enqueue line for asynchronous background disk write
             std::unique_lock<std::mutex> lock(mutex_);
             logQueue_.emplace_back(line, static_cast<size_t>(len));
+            enqueued_.fetch_add(1, std::memory_order_release);
             cv_.notify_one();
+        }
+    }
+
+    // Blocks until every line queued so far has reached the disk (error paths only).
+    void Flush(uint32_t timeoutMs = 500) {
+        const uint64_t target = enqueued_.load(std::memory_order_acquire);
+        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+        cv_.notify_all();
+        while (written_.load(std::memory_order_acquire) < target && GetTickCount64() < deadline) {
+            Sleep(1);
         }
     }
 
@@ -140,6 +151,7 @@ private:
 
         if (len > 0) {
             logQueue_.emplace_back(line, static_cast<size_t>(len));
+            enqueued_.fetch_add(1, std::memory_order_release);
             cv_.notify_one();
         }
     }
@@ -169,6 +181,7 @@ private:
                     DWORD written = 0;
                     WriteFile(fileHandle_, entry.data(), static_cast<DWORD>(entry.size()), &written, nullptr);
                 }
+                written_.fetch_add(localLogQueue.size(), std::memory_order_release);
                 localLogQueue.clear();
             }
 
@@ -213,6 +226,8 @@ private:
     std::condition_variable cv_;
     std::thread workerThread_;
     std::atomic<bool> running_{ false };
+    std::atomic<uint64_t> enqueued_{ 0 };
+    std::atomic<uint64_t> written_{ 0 };
     std::vector<std::string> logQueue_;
     std::vector<DumpTask> dumpQueue_;
 };
