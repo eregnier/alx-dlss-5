@@ -143,6 +143,19 @@
   - [x] Persistance en temps réel des paramètres dans `hlx_dlss5.ini`.
   - [x] Documentation complète dans [`docs/STEAMVR_INPUT_AND_VR_MENU_RUNBOOK.md`](file:///C:/code/hlx-dlss5/docs/STEAMVR_INPUT_AND_VR_MENU_RUNBOOK.md).
 
+- [x] **Jalon 9 : Installeur C++ Autonome, Hygiène Git & Packaging de Release**
+  - [x] **Nettoyage Git radical** : Suppression de ~50 Mo de dumps GPU et captures debug temporaires (`dump_*.raw`, `current_*.png`).
+  - [x] **Élimination des chemins locaux en dur** : Résolution relative du dossier du module et interrogation dynamique du registre Windows (`Software\Valve\Steam\SteamPath` + `libraryfolders.vdf`).
+  - [x] **Installeur Standalone C++ Win32 (`HLX-DLSS5-Installer.exe`)** :
+    - Détection automatique en un clic de l'installation Steam de *Half-Life: Alyx*.
+    - Recherche intelligente du modèle `nvngx_dlssnr.dll` sur les disques et bibliothèques Steam avec vérification de version PE (`310.8.x`).
+    - Gestion multi-matches avec sélection interactive, copie automatique et file picker.
+    - Backup automatique du binaire vanilla `openvr_api.dll` vers `openvr_api_real.dll` et restauration intégrale 1-clic.
+    - Zéro dépendance externe (Win32 / Common Controls v6 pur, ~119 Ko).
+  - [x] **Pipeline de build automatisé `dist/`** : Compilation et packaging immédiat de la release (sans le modèle propriétaire).
+  - [x] **Documentation grand public** : `README.md` complet en anglais avec runbook de contrôles VR et configuration.
+  - [x] **Validation 18/18 tests unitaires CTest** (100% PASS).
+
 ---
 
 ## 🔒 5. Exigences & Contraintes Techniques Critiques

@@ -234,12 +234,26 @@ static bool LoadRealOpenVR() {
     // 1. Try openvr_api_real.dll (standard proxy pattern)
     HMODULE hMod = LoadLibraryW(L"openvr_api_real.dll");
 
-    // 2. Try SteamVR default runtime path
+    // 2. Query Steam installation directory from Windows Registry
+    if (!hMod) {
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            wchar_t steamPath[MAX_PATH] = {};
+            DWORD valType = 0, valSize = sizeof(steamPath);
+            if (RegQueryValueExW(hKey, L"SteamPath", nullptr, &valType, reinterpret_cast<LPBYTE>(steamPath), &valSize) == ERROR_SUCCESS) {
+                std::wstring openvrInSteam = std::wstring(steamPath) + L"\\openvr_api.dll";
+                std::wstring openvrInSteamVR = std::wstring(steamPath) + L"\\steamapps\\common\\SteamVR\\bin\\win64\\openvr_api.dll";
+                hMod = LoadLibraryW(openvrInSteam.c_str());
+                if (!hMod) hMod = LoadLibraryW(openvrInSteamVR.c_str());
+            }
+            RegCloseKey(hKey);
+        }
+    }
+
+    // 3. Fallback to standard Steam paths
     if (!hMod) {
         hMod = LoadLibraryW(L"C:\\Program Files (x86)\\Steam\\openvr_api.dll");
     }
-
-    // 3. Try SteamVR bin folder
     if (!hMod) {
         hMod = LoadLibraryW(L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\bin\\win64\\openvr_api.dll");
     }
@@ -1702,12 +1716,12 @@ static vr::EVRCompositorError Hooked_Submit_Impl(
 
                 // Diagnostics frame dump (manual trigger only, checked at most once every 600 frames to avoid disk stalls)
                 if (currentFrame % 600 == 0) {
-                    bool triggerFileExists = (GetFileAttributesW(L"C:\\code\\hlx-dlss5\\dump_trigger.txt") != INVALID_FILE_ATTRIBUTES);
+                    bool triggerFileExists = (GetFileAttributesW(L"dump_trigger.txt") != INVALID_FILE_ATTRIBUTES);
                     if (triggerFileExists && d3d11Device && d3d11Context) {
-                        DeleteFileW(L"C:\\code\\hlx-dlss5\\dump_trigger.txt");
+                        DeleteFileW(L"dump_trigger.txt");
                         HLX_INFO("Manual dump trigger detected at Frame %llu for Eye %u!", currentFrame, eyeIdx);
-                        DumpD3D11TextureToDisk(d3d11Device, d3d11Context, eye.fullNativeTex11, L"C:\\code\\hlx-dlss5\\dump_input.raw");
-                        DumpD3D11TextureToDisk(d3d11Device, d3d11Context, eye.fullCompositedTex11, L"C:\\code\\hlx-dlss5\\dump_output.raw");
+                        DumpD3D11TextureToDisk(d3d11Device, d3d11Context, eye.fullNativeTex11, L"dump_input.raw");
+                        DumpD3D11TextureToDisk(d3d11Device, d3d11Context, eye.fullCompositedTex11, L"dump_output.raw");
                     }
                 }
 

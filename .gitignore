@@ -1,8 +1,26 @@
+# Build and distribution directories
 build/
-bin/
-*.log
+dist/
+dumps/
+.vs/
+.vscode/
+
+# Binaries and intermediate build artifacts
 *.obj
 *.exe
-*.dll
 *.pdb
-.vs/
+*.ilk
+*.exp
+*.lib
+
+# Runtime logs and dumps
+*.log
+*.raw
+*.tga
+dump_trigger.txt
+current_*.png
+preview_*.png
+
+# Ignore root DLLs but allow tracked dependencies under external/
+*.dll
+!external/forwarder/nvngx.dll_dlssnr.dll

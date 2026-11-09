@@ -99,3 +99,31 @@ add_test(NAME VRMenuTest COMMAND test_vr_menu)
 
 add_executable(test_input_combos tests/test_input_combos.cpp)
 add_test(NAME InputCombosTest COMMAND test_input_combos)
+
+# 3. Native Win32 GUI Installer
+add_executable(HLX-DLSS5-Installer WIN32
+    installer/installer.cpp
+)
+
+target_link_libraries(HLX-DLSS5-Installer PRIVATE
+    comctl32
+    version
+    shlwapi
+    shell32
+    ole32
+    user32
+    gdi32
+    advapi32
+)
+
+# 4. Distribution Package Assembly (dist/)
+add_custom_target(dist_package ALL
+    DEPENDS openvr_api HLX-DLSS5-Installer
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_SOURCE_DIR}/dist
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:HLX-DLSS5-Installer> ${CMAKE_CURRENT_SOURCE_DIR}/dist/HLX-DLSS5-Installer.exe
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:openvr_api> ${CMAKE_CURRENT_SOURCE_DIR}/dist/openvr_api.dll
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/external/forwarder/nvngx.dll_dlssnr.dll ${CMAKE_CURRENT_SOURCE_DIR}/dist/nvngx.dll_dlssnr.dll
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/hlx_dlss5.ini ${CMAKE_CURRENT_SOURCE_DIR}/dist/hlx_dlss5.ini
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/README.md ${CMAKE_CURRENT_SOURCE_DIR}/dist/README.txt
+    COMMENT "Assembling clean release package in dist/..."
+)

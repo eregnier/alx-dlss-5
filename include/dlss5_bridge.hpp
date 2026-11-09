@@ -138,16 +138,29 @@ public:
         HLX_INFO("Initialized NGX Core capability parameters: %p (init=0x%08X, cap=0x%08X)", capabilityParams_, initRes, capRes);
 
         // 2. Load nvngx.dll_dlssnr.dll forwarder
-        const wchar_t* candidatePaths[] = {
-            L"nvngx.dll_dlssnr.dll",
-            L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Half-Life Alyx\\game\\bin\\win64\\nvngx.dll_dlssnr.dll",
-            L"C:\\code\\dlss5-vr\\dist\\DLSS5-VR-Release\\deps\\nvngx.dll_dlssnr.dll"
-        };
+        wchar_t modPath[MAX_PATH] = {};
+        HMODULE hModThis = nullptr;
+        std::wstring moduleForwarder = L"";
+        std::wstring moduleNr = L"";
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&g_dummyConfigSymbol), &hModThis) && hModThis) {
+            GetModuleFileNameW(hModThis, modPath, MAX_PATH);
+            wchar_t* slash = wcsrchr(modPath, L'\\');
+            if (slash) {
+                *(slash + 1) = L'\0';
+                moduleForwarder = std::wstring(modPath) + L"nvngx.dll_dlssnr.dll";
+                moduleNr = std::wstring(modPath) + L"nvngx_dlssnr.dll";
+            }
+        }
 
-        for (const auto* path : candidatePaths) {
-            hForwarder_ = LoadLibraryW(path);
+        std::vector<std::wstring> candidatePaths;
+        if (!moduleForwarder.empty()) candidatePaths.push_back(moduleForwarder);
+        candidatePaths.push_back(L"nvngx.dll_dlssnr.dll");
+
+        for (const auto& path : candidatePaths) {
+            hForwarder_ = LoadLibraryW(path.c_str());
             if (hForwarder_) {
-                HLX_INFO("Successfully loaded forwarder from: %ls", path);
+                HLX_INFO("Successfully loaded forwarder from: %ls", path.c_str());
                 break;
             }
         }
@@ -173,15 +186,14 @@ public:
         }
 
         // 3. Locate DLSS 5 Neural Model nvngx_dlssnr.dll
-        const wchar_t* nrCandidates[] = {
-            L"nvngx_dlssnr.dll",
-            L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Half-Life Alyx\\game\\bin\\win64\\nvngx_dlssnr.dll",
-            L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Cyberpunk 2077\\bin\\x64\\nvngx_dlssnr.dll"
-        };
-        for (const auto* path : nrCandidates) {
-            if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        std::vector<std::wstring> nrCandidates;
+        if (!moduleNr.empty()) nrCandidates.push_back(moduleNr);
+        nrCandidates.push_back(L"nvngx_dlssnr.dll");
+
+        for (const auto& path : nrCandidates) {
+            if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 nrSnippetPath_ = path;
-                HLX_INFO("Located DLSS 5 Neural Model: %ls", path);
+                HLX_INFO("Located DLSS 5 Neural Model: %ls", path.c_str());
                 break;
             }
         }
