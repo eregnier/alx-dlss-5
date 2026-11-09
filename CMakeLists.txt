@@ -100,6 +100,10 @@ add_test(NAME VRMenuTest COMMAND test_vr_menu)
 add_executable(test_input_combos tests/test_input_combos.cpp)
 add_test(NAME InputCombosTest COMMAND test_input_combos)
 
+add_executable(test_installer_logic tests/test_installer_logic.cpp)
+target_link_libraries(test_installer_logic PRIVATE version advapi32)
+add_test(NAME InstallerLogicTest COMMAND test_installer_logic)
+
 # 3. Native Win32 GUI Installer
 add_executable(HLX-DLSS5-Installer WIN32
     installer/installer.cpp

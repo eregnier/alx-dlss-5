@@ -6,11 +6,60 @@ Combines **dual-instance NGX temporal isolation**, **Cheeky Dynamic Foveated Ren
 
 ---
 
+## 📢 Real-World Testing & Honest Performance Expectations
+
+* **Hardware tested on**:
+  * **Meta Quest 3** (via Virtual Desktop / Steam Link).
+  * **Pimax Dream Air / Crystal / Super** (with eye tracking / DFR).
+* **Performance Reality Check**:
+  * Let's be completely candid: running full-resolution stereoscopic neural inference at 72-90 FPS per eye is **extremely demanding on hardware**.
+  * **It's not magic free performance**, and full-screen inference can be heavy. However, **it works surprisingly well**, especially with **Dynamic Foveated Rendering (DFR)** enabled.
+  * When your headset supports eye tracking (e.g. Pimax Crystal), the foveated zone tracks your gaze in real time. Combined with `WorkingScale=0.50`, it cuts GPU neural inference time by ~4x while maintaining crisp native pixel resolution in the sweetspot!
+
+---
+
+## 🛡️ Security & VirusTotal Recommendation
+
+> [!IMPORTANT]
+> **Always verify your mods!**  
+> Whether you download binaries from this project, NexusMods, Discord, or anywhere else on the web, **you should always upload and check the executable and DLL files on [VirusTotal.com](https://www.virustotal.com/)** before running them.  
+> The installer is compiled with standard MSVC from open-source code in this repository, but verifying files independently is simply good security hygiene.
+
+---
+
+## 🎮 Controls & Shortcuts (Controllers & Keyboard)
+
+You can adjust all settings and toggle DLSS 5 either with your VR motion controllers or directly from your keyboard!
+
+### VR Motion Controllers (Quest 3 Touch Plus / Pimax / Index)
+
+| Action | Controller Shortcut | Description |
+| :--- | :--- | :--- |
+| **Open / Close VR Menu** | **Left D-Pad** (thumb flat on touch area) + **Right Trigger** | Toggles the in-headset settings overlay (70 cm in front of gaze). |
+| **Fallback Menu Open** | **Right Stick Up** ($Y > 0.65$) | Alternative single-hand shortcut to open the menu. |
+| **Quick DLSS ON/OFF** | **Left D-Pad** + **Right Grip** | Instantly toggles DLSS 5 Neural Reconstruction ON/OFF for immediate A/B visual comparison (silent, no menu). |
+| **Navigate Settings** | **Left Stick Up / Down** | Selects previous or next parameter in the list. |
+| **Adjust Values** | **Left Stick Left / Right** | Increases or decreases the selected parameter in real time. |
+
+### Keyboard Shortcuts (Desktop / Wireless Keyboard)
+
+| Action | Key / Shortcut | Description |
+| :--- | :--- | :--- |
+| **Quick DLSS ON/OFF** | `F7` or `NumPad -` or `-` | Instant DLSS 5 toggle ON / Bypass. |
+| **Open / Close VR Menu** | `F8` or `F11` or `Ctrl + Alt + D` or `NumPad *` | Toggles the floating in-game VR configuration overlay. |
+| **Navigate Settings** | `Arrow Up` / `Arrow Down` | Move cursor between parameters. |
+| **Adjust Values** | `Arrow Left` / `Arrow Right` | Decrease or increase selected value. |
+| **Toggle Checkboxes** | `Enter` or `Space` | Toggle booleans (e.g., Foveated, EyeTracking, Border). |
+| **Close Menu** | `Escape` | Dismisses the overlay. |
+| **Toggle Fovea Border** | `F9` | Shows/hides the green foveated circle for optical alignment. |
+
+---
+
 ## 🌟 Key Features
 
 * **Stereo-Isolated Dual NGX Engine**: Dedicated Neural Reconstruction instances for Left and Right eye, eliminating temporal interocular cross-talk, shimmering, and eye desynchronization.
 * **Cheeky Dynamic Foveated Rendering (DFR)**: Evaluates neural inference exclusively in the high-acuity fovea with smooth cosine feathering. Supports hardware eye tracking (Pimax Crystal, SteamVR Eye Tracking) to follow your gaze in real time.
-* **In-Game VR Menu & Real-Time Tuning**: Seamless overlay projected in front of the headset. Adjust sharpness, detail boost, foveation scale, and inference passes on the fly with your VR controllers.
+* **In-Game VR Menu & Real-Time Tuning**: Seamless overlay projected in front of the headset. Adjust sharpness, detail boost, foveation scale, and inference passes on the fly with your VR controllers or keyboard.
 * **Matched Residual Composition**: Merges high-frequency neural reconstruction with native resolution pixels, delivering up to 4x GPU inference speedup at `WorkingScale=0.50` with zero blur.
 * **Zero-Intrusion OpenVR Proxy**: Drop-in `openvr_api.dll` proxy requiring zero modifications or patches to the game binary. Instant, reversible vanilla restore.
 * **Native C++ Standalone Installer**: Simple, lightweight GUI installer with automated Steam library discovery and whole-disk DLSS 5 model detection.
@@ -22,7 +71,7 @@ Combines **dual-instance NGX temporal isolation**, **Cheeky Dynamic Foveated Ren
 * **GPU**: NVIDIA GeForce RTX (RTX 40 or 50 series recommended for optimal DLSS-NR performance).
 * **OS**: Windows 10 / 11 (64-bit).
 * **Game**: *Half-Life: Alyx* on Steam.
-* **VR Headset**: SteamVR-compatible headset (Pimax Crystal / Dream Air, Valve Index, Meta Quest via Virtual Desktop / Steam Link).
+* **VR Headset**: SteamVR-compatible headset (Meta Quest 3, Pimax Crystal / Dream Air, Valve Index, etc.).
 
 ---
 
@@ -30,7 +79,7 @@ Combines **dual-instance NGX temporal isolation**, **Cheeky Dynamic Foveated Ren
 
 ### Option 1: Automatic Setup via Installer (Recommended)
 
-1. Download the latest release archive (`HLX-DLSS5-v1.0.0.zip`).
+1. Download the release archive (`HLX-DLSS5-v1.0.0.zip`).
 2. Extract the folder anywhere and run **`HLX-DLSS5-Installer.exe`**.
 3. The installer will automatically locate your *Half-Life: Alyx* installation (`game/bin/win64`).
 4. **DLSS 5 Model Acquisition (`nvngx_dlssnr.dll`)**:
@@ -46,18 +95,6 @@ Combines **dual-instance NGX temporal isolation**, **Cheeky Dynamic Foveated Ren
    *(Before copying, rename the game's original `openvr_api.dll` to `openvr_api_real.dll`)*.
 2. Copy `nvngx.dll_dlssnr.dll` and `hlx_dlss5.ini` into `<GameDir>\game\bin\win64\`.
 3. Copy a compatible NVIDIA `nvngx_dlssnr.dll` into `<GameDir>\game\bin\win64\`.
-
----
-
-## 🎮 In-Game VR Controls & Menu
-
-| Action | Controller Shortcut | Description |
-| :--- | :--- | :--- |
-| **Open VR Menu** | **Left D-Pad** (thumb on flat area) + **Right Trigger** | Toggles the in-headset settings overlay (70 cm in front of gaze). |
-| **Alternative Menu Trigger** | **Right Stick Up** ($Y > 0.65$) | Instant fallback trigger to open the menu. |
-| **Quick DLSS ON/OFF** | **Left D-Pad** + **Right Grip** | Instantly toggles DLSS 5 Neural Reconstruction ON/OFF for A/B comparison without opening the menu. |
-| **Navigate Parameters** | **Left Joystick Up / Down** | Selects previous or next parameter. |
-| **Adjust Values** | **Left Joystick Left / Right** | Increases or decreases selected setting in real time. |
 
 ---
 
@@ -89,7 +126,7 @@ HLX-DLSS5 includes an extensive test suite verifying:
 * Zero-touch VTable interception without compositor rejection.
 * Inter-API D3D11 <-> D3D12 hardware synchronization and shared textures.
 * Single-pass stereo atlas reuse dividing compositor latency in half.
-* 18/18 automated CTest unit and integration tests passing.
+* 19/19 automated CTest unit and integration tests passing.
 
 ---
 

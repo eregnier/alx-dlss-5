@@ -4,6 +4,7 @@ dist/
 dumps/
 .vs/
 .vscode/
+*.zip
 
 # Binaries and intermediate build artifacts
 *.obj
