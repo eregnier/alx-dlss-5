@@ -77,17 +77,21 @@ You can adjust all settings and toggle DLSS 5 either with your VR motion control
 
 ## 🚀 Quick Start & Installation
 
+> [!TIP]
+> **Play Normally**: Once installed, **you do NOT need to keep this installer open or re-run it before playing!** The mod automatically hooks in via `openvr_api.dll` whenever *Half-Life: Alyx* launches from Steam, SteamVR, or your headset. You only need this installer again if you want to update or uninstall (restore vanilla).
+
 ### Option 1: Automatic Setup via Installer (Recommended)
 
 1. Download the release archive (`HLX-DLSS5-v1.0.0.zip`).
 2. Extract the folder anywhere and run **`HLX-DLSS5-Installer.exe`**.
-3. The installer will automatically locate your *Half-Life: Alyx* installation (`game/bin/win64`).
+3. **Target Directory**: The installer auto-detects your game installation. You can also click **`Auto-Find Alyx`** to scan your Steam library folders, or **`Browse...`** to pick manually.
 4. **DLSS 5 Model Acquisition (`nvngx_dlssnr.dll`)**:
-   * NVIDIA's neural model (`nvngx_dlssnr.dll`, ~165 MB) is proprietary and not bundled in the download.
-   * Click **`Search on my PC`**: The installer will search your Steam game installations (e.g. Cyberpunk 2077) and local drives to locate and verify compatible versions.
-   * Or click **`Select File...`** to pick an existing `nvngx_dlssnr.dll` file.
+   * > [!WARNING]
+     > **Do NOT confuse with DLSS 4 / 4.5**: Standard DLSS 4/4.5 Super Resolution (`nvngx_dlss.dll`, ~58 MB) and Ray Reconstruction (`nvngx_dlssd.dll`, ~48 MB) **will NOT work**. This mod requires the dedicated **DLSS 5 Neural Reconstruction model** (`nvngx_dlssnr.dll`, ~165 MB, version **310.8+**).
+   * Click **`Search on my PC`**: The installer will search your Steam game libraries (e.g. Cyberpunk 2077) and local drives to locate and strictly verify genuine DLSS 5 models.
+   * Or click **`Select File...`** to select an existing `nvngx_dlssnr.dll` file.
 5. Click **`Install / Update Mod`**.
-6. Launch *Half-Life: Alyx* via Steam.
+6. Close the installer and launch *Half-Life: Alyx* as usual!
 
 ### Option 2: Manual Installation
 

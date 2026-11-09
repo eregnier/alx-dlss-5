@@ -162,7 +162,7 @@ bool TestValidateDlssNrFile(const std::wstring& path, std::wstring& outVersion, 
                     (internalName.find(L"DLSSNR") != std::wstring::npos) ||
                     (desc.find(L"DLSSNR") != std::wstring::npos);
     if (!isDlssNr) return false;
-    if (fileVer.find(L"310.") != 0) return false;
+    if (fileVer.find(L"310.8") != 0 && fileVer.find(L"310.9") != 0) return false;
 
     outVersion = fileVer;
     outSize = size;

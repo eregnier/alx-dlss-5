@@ -42,6 +42,7 @@ namespace fs = std::filesystem;
 #define IDC_BTN_LAUNCH_STEAM    2009
 #define IDC_BTN_EXIT            2010
 #define IDC_EDIT_LOG            2011
+#define IDC_BTN_FIND_ALYX       2012
 
 struct DlssMatch {
     std::wstring path;
@@ -199,7 +200,7 @@ bool ValidateDlssNrFile(const std::wstring& path, DlssMatch& outMatch) {
         return false;
     }
 
-    // 2. Verify it is DLSSNR (Neural Reconstruction), NOT DLSS SR or DLSSD RR
+    // 2. Verify it is DLSSNR (Neural Reconstruction), NOT DLSS SR (DLSS 2/3/4) or DLSSD RR (DLSS 3.5/4.5)
     bool isDlssNr = (product.find(L"DLSSNR") != std::wstring::npos) ||
                     (internalName.find(L"DLSSNR") != std::wstring::npos) ||
                     (desc.find(L"DLSSNR") != std::wstring::npos);
@@ -207,8 +208,8 @@ bool ValidateDlssNrFile(const std::wstring& path, DlssMatch& outMatch) {
         return false;
     }
 
-    // 3. Verify Version is 310.x (DLSS 5 generation)
-    if (fileVer.find(L"310.") != 0) {
+    // 3. Verify Version is strictly DLSS 5 branch (310.8.x / 310.9.x), NOT DLSS 4 / 4.5
+    if (fileVer.find(L"310.8") != 0 && fileVer.find(L"310.9") != 0) {
         return false;
     }
 
@@ -583,9 +584,13 @@ void PerformInstall() {
 
     UpdateDllStatus();
     AppendLog(L"[SUCCESS] HLX-DLSS5 is installed and ready to play!");
+    AppendLog(L"[NOTE] You can now launch Half-Life: Alyx normally without reopening this installer.");
     MessageBoxW(g_hWnd,
         L"HLX-DLSS5 has been successfully installed!\n\n"
-        L"Launch Half-Life: Alyx via Steam.\n\n"
+        L"IMPORTANT NOTICE:\n"
+        L"• You do NOT need to re-run or keep this installer open before playing!\n"
+        L"• The mod automatically loads every time you start Half-Life: Alyx from Steam or your VR headset.\n"
+        L"• You only need to run this installer again if you want to update or uninstall (restore vanilla).\n\n"
         L"In VR:\n"
         L"• Left D-Pad + Right Trigger (or Right Stick Up) to open the VR Menu.\n"
         L"• Left D-Pad + Right Grip for quick DLSS 5 toggle ON/OFF.",
@@ -634,12 +639,17 @@ void LaunchAlyxSteam() {
 void ShowDllHelpDialog(HWND hParent) {
     const wchar_t* msg =
         L"How to obtain NVIDIA DLSS 5 Neural Model (nvngx_dlssnr.dll):\n\n"
+        L"⚠️ IMPORTANT: Do NOT confuse with DLSS 3/4/4.5:\n"
+        L"• DLSS 4/4.5 Super Resolution (nvngx_dlss.dll, ~58 MB) will NOT work.\n"
+        L"• DLSS 3.5/4.5 Ray Reconstruction (nvngx_dlssd.dll, ~48 MB) will NOT work.\n"
+        L"• ONLY DLSS 5 Neural Reconstruction (nvngx_dlssnr.dll, ~165 MB, branch 310.8+) is compatible.\n\n"
+        L"Sources for nvngx_dlssnr.dll:\n"
         L"1. Cyberpunk 2077 or DLSS 5 enabled games:\n"
         L"   Copy 'nvngx_dlssnr.dll' (~165 MB) from:\n"
         L"   Cyberpunk 2077\\bin\\x64\\nvngx_dlssnr.dll\n\n"
         L"2. Automated PC Search:\n"
         L"   Click 'Search on my PC'. The installer will scan your Steam libraries\n"
-        L"   and local drives, then let you select which version to copy.\n\n"
+        L"   and local drives, verifying that it is genuine DLSS 5 (310.8+).\n\n"
         L"3. Manual Placement:\n"
         L"   If you downloaded the file separately, click 'Select File...' to point to it,\n"
         L"   or place it directly inside:\n"
@@ -682,11 +692,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         SendMessageW(hGrpTarget, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
 
         g_hEditTarget = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, x + 15, y + 26, 505, 24, hWnd, reinterpret_cast<HMENU>(IDC_EDIT_TARGET_PATH), nullptr, nullptr);
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, x + 15, y + 26, 410, 24, hWnd, reinterpret_cast<HMENU>(IDC_EDIT_TARGET_PATH), nullptr, nullptr);
         SendMessageW(g_hEditTarget, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
 
+        HWND hBtnFindAlyx = CreateWindowW(L"BUTTON", L"Auto-Find Alyx",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x + 430, y + 25, 115, 26, hWnd, reinterpret_cast<HMENU>(IDC_BTN_FIND_ALYX), nullptr, nullptr);
+        SendMessageW(hBtnFindAlyx, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
+
         HWND hBtnBrowse = CreateWindowW(L"BUTTON", L"Browse...",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x + 530, y + 25, 100, 26, hWnd, reinterpret_cast<HMENU>(IDC_BTN_BROWSE_TARGET), nullptr, nullptr);
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x + 550, y + 25, 80, 26, hWnd, reinterpret_cast<HMENU>(IDC_BTN_BROWSE_TARGET), nullptr, nullptr);
         SendMessageW(hBtnBrowse, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
 
         g_hLblTargetStatus = CreateWindowW(L"STATIC", L"Status: Detecting Half-Life: Alyx...",
@@ -777,6 +791,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             if (!folder.empty()) {
                 SetWindowTextW(g_hEditTarget, folder.c_str());
                 UpdateTargetValidation();
+            }
+        } else if (id == IDC_BTN_FIND_ALYX) {
+            AppendLog(L"Scanning Steam libraries for Half-Life: Alyx...");
+            std::wstring found = AutoDetectAlyxDir();
+            if (!found.empty()) {
+                SetWindowTextW(g_hEditTarget, found.c_str());
+                UpdateTargetValidation();
+                AppendLog(L"[OK] Found Half-Life: Alyx: " + found);
+            } else {
+                AppendLog(L"[WARNING] Half-Life: Alyx not detected in default Steam libraries. Please use 'Browse...'.");
+                MessageBoxW(hWnd, L"Half-Life: Alyx was not found automatically.\nPlease click 'Browse...' to select your 'game/bin/win64' directory.", L"Alyx Not Found", MB_ICONINFORMATION);
             }
         } else if (id == IDC_BTN_SEARCH_PC) {
             if (g_isSearching.load()) {
