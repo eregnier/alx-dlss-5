@@ -98,6 +98,77 @@ std::vector<std::wstring> TestDetectSteamLibraries() {
     return libs;
 }
 
+std::wstring TestQueryStringTableValue(BYTE* data, WORD lang, WORD cp, const wchar_t* key) {
+    wchar_t subBlock[128];
+    swprintf_s(subBlock, L"\\StringFileInfo\\%04x%04x\\%s", lang, cp, key);
+    wchar_t* strVal = nullptr;
+    UINT strLen = 0;
+    if (VerQueryValueW(data, subBlock, reinterpret_cast<LPVOID*>(&strVal), &strLen) && strVal && strLen > 0) {
+        return std::wstring(strVal);
+    }
+    return L"";
+}
+
+bool TestValidateDlssNrFile(const std::wstring& path, std::wstring& outVersion, uint64_t& outSize) {
+    std::error_code ec;
+    uint64_t size = fs::file_size(path, ec);
+    if (ec || size < 100ULL * 1024 * 1024 || size > 250ULL * 1024 * 1024) {
+        return false;
+    }
+
+    DWORD dummy = 0;
+    DWORD verSize = GetFileVersionInfoSizeW(path.c_str(), &dummy);
+    if (verSize == 0) return false;
+
+    std::vector<BYTE> data(verSize);
+    if (!GetFileVersionInfoW(path.c_str(), 0, verSize, data.data())) return false;
+
+    struct LANGANDCODEPAGE {
+        WORD wLanguage;
+        WORD wCodePage;
+    } *lpTranslate = nullptr;
+    UINT cbTranslate = 0;
+
+    std::wstring company = L"";
+    std::wstring product = L"";
+    std::wstring internalName = L"";
+    std::wstring desc = L"";
+    std::wstring fileVer = L"";
+
+    if (VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<LPVOID*>(&lpTranslate), &cbTranslate) && cbTranslate >= sizeof(LANGANDCODEPAGE)) {
+        WORD lang = lpTranslate[0].wLanguage;
+        WORD cp   = lpTranslate[0].wCodePage;
+        company      = TestQueryStringTableValue(data.data(), lang, cp, L"CompanyName");
+        product      = TestQueryStringTableValue(data.data(), lang, cp, L"ProductName");
+        internalName = TestQueryStringTableValue(data.data(), lang, cp, L"InternalName");
+        desc         = TestQueryStringTableValue(data.data(), lang, cp, L"FileDescription");
+        fileVer      = TestQueryStringTableValue(data.data(), lang, cp, L"FileVersion");
+    }
+
+    if (fileVer.empty()) {
+        VS_FIXEDFILEINFO* ffi = nullptr;
+        UINT ffiLen = 0;
+        if (VerQueryValueW(data.data(), L"\\", reinterpret_cast<LPVOID*>(&ffi), &ffiLen) && ffi) {
+            wchar_t verBuf[64];
+            swprintf_s(verBuf, L"%u.%u.%u.%u",
+                HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
+                HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
+            fileVer = verBuf;
+        }
+    }
+
+    if (company.find(L"NVIDIA") == std::wstring::npos) return false;
+    bool isDlssNr = (product.find(L"DLSSNR") != std::wstring::npos) ||
+                    (internalName.find(L"DLSSNR") != std::wstring::npos) ||
+                    (desc.find(L"DLSSNR") != std::wstring::npos);
+    if (!isDlssNr) return false;
+    if (fileVer.find(L"310.") != 0) return false;
+
+    outVersion = fileVer;
+    outSize = size;
+    return true;
+}
+
 int main() {
     std::wcout << L"========================================================" << std::endl;
     std::wcout << L"  HLX-DLSS5: Test Suite - Installer Core Logic" << std::endl;
@@ -176,6 +247,27 @@ int main() {
         assert(!fs::exists(realBackupDll) && "Backup file should be cleaned up on uninstall");
     }
     std::wcout << L"  -> Uninstall step: Vanilla restored, backup removed cleanly." << std::endl;
+
+    // 4. Test Rigorous DLSS-NR Validation
+    std::wcout << L"[TEST 4] Rigorous DLSS 5 Model Validator..." << std::endl;
+    std::wstring dummyVer;
+    uint64_t dummySz = 0;
+    // 4a. Must reject non-NVIDIA or system DLLs
+    bool sysRes = TestValidateDlssNrFile(kernel32, dummyVer, dummySz);
+    std::wcout << L"  -> Validating kernel32.dll (expect reject): " << (sysRes ? L"ACCEPTED (ERROR)" : L"REJECTED (OK)") << std::endl;
+    assert(!sysRes && "Validator must reject non-DLSSNR files");
+
+    // 4b. If local DLSS-NR model is installed in Alyx directory, must accept and extract 310.8.x
+    std::wstring realModel = L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Half-Life Alyx\\game\\bin\\win64\\nvngx_dlssnr.dll";
+    if (fs::exists(realModel)) {
+        std::wstring nrVer;
+        uint64_t nrSz = 0;
+        bool nrRes = TestValidateDlssNrFile(realModel, nrVer, nrSz);
+        std::wcout << L"  -> Validating real DLSS-NR model: " << (nrRes ? L"ACCEPTED (OK)" : L"REJECTED (ERROR)") << std::endl;
+        std::wcout << L"     - Version: " << nrVer << L", Size: " << (nrSz / (1024 * 1024)) << L" MB" << std::endl;
+        assert(nrRes && "Validator must accept valid DLSS-NR model");
+        assert(nrVer.find(L"310.") == 0 && "Version must be in DLSS 5 branch");
+    }
 
     // Cleanup sandbox
     fs::remove_all(tempSandbox);

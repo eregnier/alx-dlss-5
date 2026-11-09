@@ -91,6 +91,18 @@ std::wstring FormatSizeMB(uint64_t bytes) {
     return buf;
 }
 
+// Helper: Read a string from PE Version StringTable
+std::wstring QueryStringTableValue(BYTE* data, WORD lang, WORD cp, const wchar_t* key) {
+    wchar_t subBlock[128];
+    swprintf_s(subBlock, L"\\StringFileInfo\\%04x%04x\\%s", lang, cp, key);
+    wchar_t* strVal = nullptr;
+    UINT strLen = 0;
+    if (VerQueryValueW(data, subBlock, reinterpret_cast<LPVOID*>(&strVal), &strLen) && strVal && strLen > 0) {
+        return std::wstring(strVal);
+    }
+    return L"";
+}
+
 // Helper: Read PE File Version Info
 std::wstring ReadDllVersion(const std::wstring& path) {
     DWORD dummy = 0;
@@ -102,51 +114,106 @@ std::wstring ReadDllVersion(const std::wstring& path) {
         return L"Unknown";
     }
 
-    // Try VS_FIXEDFILEINFO first
+    struct LANGANDCODEPAGE {
+        WORD wLanguage;
+        WORD wCodePage;
+    } *lpTranslate = nullptr;
+    UINT cbTranslate = 0;
+
+    if (VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<LPVOID*>(&lpTranslate), &cbTranslate) && cbTranslate >= sizeof(LANGANDCODEPAGE)) {
+        std::wstring strVer = QueryStringTableValue(data.data(), lpTranslate[0].wLanguage, lpTranslate[0].wCodePage, L"FileVersion");
+        if (!strVer.empty()) return strVer;
+    }
+
+    // Fallback to fixed file info
     VS_FIXEDFILEINFO* ffi = nullptr;
     UINT ffiLen = 0;
     if (VerQueryValueW(data.data(), L"\\", reinterpret_cast<LPVOID*>(&ffi), &ffiLen) && ffi) {
-        DWORD major = HIWORD(ffi->dwFileVersionMS);
-        DWORD minor = LOWORD(ffi->dwFileVersionMS);
-        DWORD build = HIWORD(ffi->dwFileVersionLS);
-        DWORD rev   = LOWORD(ffi->dwFileVersionLS);
-
-        // Try StringFileInfo for special tags like 310.8.SF.0
-        struct LANGANDCODEPAGE {
-            WORD wLanguage;
-            WORD wCodePage;
-        } *lpTranslate;
-        UINT cbTranslate = 0;
-
-        if (VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<LPVOID*>(&lpTranslate), &cbTranslate) && cbTranslate >= sizeof(LANGANDCODEPAGE)) {
-            wchar_t subBlock[128];
-            swprintf_s(subBlock, L"\\StringFileInfo\\%04x%04x\\FileVersion", lpTranslate[0].wLanguage, lpTranslate[0].wCodePage);
-            wchar_t* strVer = nullptr;
-            UINT strVerLen = 0;
-            if (VerQueryValueW(data.data(), subBlock, reinterpret_cast<LPVOID*>(&strVer), &strVerLen) && strVer && wcslen(strVer) > 0) {
-                return std::wstring(strVer);
-            }
-        }
-
         wchar_t verBuf[64];
-        swprintf_s(verBuf, L"%u.%u.%u.%u", major, minor, build, rev);
+        swprintf_s(verBuf, L"%u.%u.%u.%u",
+            HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
+            HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
         return verBuf;
     }
 
     return L"Unknown";
 }
 
-// Helper: Validate DLSS-NR file (nvngx_dlssnr.dll)
+// Helper: Rigorous DLSS-NR file (nvngx_dlssnr.dll) validation
+// Guarantees:
+// 1. Valid file size between 100 MB and 250 MB (U-Net model weights are ~165 MB, distinct from DLSS SR ~58 MB and RR ~48 MB)
+// 2. CompanyName is NVIDIA
+// 3. ProductName / InternalName / Description explicitly contains "DLSSNR" (Neural Reconstruction)
+// 4. FileVersion belongs to DLSS 5 branch (310.8.x / 310.x)
 bool ValidateDlssNrFile(const std::wstring& path, DlssMatch& outMatch) {
     std::error_code ec;
     uint64_t size = fs::file_size(path, ec);
-    if (ec || size < 40 * 1024 * 1024) { // DLSS-NR models are >40 MB (typically ~165 MB)
+    if (ec || size < 100ULL * 1024 * 1024 || size > 250ULL * 1024 * 1024) {
         return false;
     }
 
-    std::wstring ver = ReadDllVersion(path);
+    DWORD dummy = 0;
+    DWORD verSize = GetFileVersionInfoSizeW(path.c_str(), &dummy);
+    if (verSize == 0) return false;
+
+    std::vector<BYTE> data(verSize);
+    if (!GetFileVersionInfoW(path.c_str(), 0, verSize, data.data())) return false;
+
+    struct LANGANDCODEPAGE {
+        WORD wLanguage;
+        WORD wCodePage;
+    } *lpTranslate = nullptr;
+    UINT cbTranslate = 0;
+
+    std::wstring company = L"";
+    std::wstring product = L"";
+    std::wstring internalName = L"";
+    std::wstring desc = L"";
+    std::wstring fileVer = L"";
+
+    if (VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<LPVOID*>(&lpTranslate), &cbTranslate) && cbTranslate >= sizeof(LANGANDCODEPAGE)) {
+        WORD lang = lpTranslate[0].wLanguage;
+        WORD cp   = lpTranslate[0].wCodePage;
+        company      = QueryStringTableValue(data.data(), lang, cp, L"CompanyName");
+        product      = QueryStringTableValue(data.data(), lang, cp, L"ProductName");
+        internalName = QueryStringTableValue(data.data(), lang, cp, L"InternalName");
+        desc         = QueryStringTableValue(data.data(), lang, cp, L"FileDescription");
+        fileVer      = QueryStringTableValue(data.data(), lang, cp, L"FileVersion");
+    }
+
+    // Fallback to fixed file info for version if string not found
+    if (fileVer.empty()) {
+        VS_FIXEDFILEINFO* ffi = nullptr;
+        UINT ffiLen = 0;
+        if (VerQueryValueW(data.data(), L"\\", reinterpret_cast<LPVOID*>(&ffi), &ffiLen) && ffi) {
+            wchar_t verBuf[64];
+            swprintf_s(verBuf, L"%u.%u.%u.%u",
+                HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
+                HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
+            fileVer = verBuf;
+        }
+    }
+
+    // 1. Verify Company is NVIDIA
+    if (company.find(L"NVIDIA") == std::wstring::npos) {
+        return false;
+    }
+
+    // 2. Verify it is DLSSNR (Neural Reconstruction), NOT DLSS SR or DLSSD RR
+    bool isDlssNr = (product.find(L"DLSSNR") != std::wstring::npos) ||
+                    (internalName.find(L"DLSSNR") != std::wstring::npos) ||
+                    (desc.find(L"DLSSNR") != std::wstring::npos);
+    if (!isDlssNr) {
+        return false;
+    }
+
+    // 3. Verify Version is 310.x (DLSS 5 generation)
+    if (fileVer.find(L"310.") != 0) {
+        return false;
+    }
+
     outMatch.path = path;
-    outMatch.version = ver;
+    outMatch.version = fileVer;
     outMatch.sizeBytes = size;
     return true;
 }
